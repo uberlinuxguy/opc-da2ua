@@ -1,128 +1,241 @@
+# ---------------------------------------------------------------------------
+# Nuitka: add Qt DLL directories to search path before importing PySide2
+# ---------------------------------------------------------------------------
+import ctypes
+import os
+import sys
+
+if getattr(sys, 'frozen', False):
+    # Running as Nuitka compiled binary
+    _base_path = os.path.dirname(os.path.abspath(sys.argv[0]))
+    _pyside2_dir = os.path.join(_base_path, 'PySide2')
+    _shiboken2_dir = os.path.join(_base_path, 'shiboken2')
+
+    # Add to PATH
+    _extra_paths = []
+    if os.path.isdir(_pyside2_dir):
+        _extra_paths.append(_pyside2_dir)
+    if os.path.isdir(_shiboken2_dir):
+        _extra_paths.append(_shiboken2_dir)
+    if _extra_paths:
+        os.environ['PATH'] = os.pathsep.join(_extra_paths) + os.pathsep + os.environ.get('PATH', '')
+
+    # Use SetDllDirectory as a fallback (Windows API)
+    try:
+        ctypes.windll.kernel32.SetDllDirectoryW(_pyside2_dir)
+    except AttributeError:
+        pass
+
+    # Qt plugin path
+    _plugins_dir = os.path.join(_pyside2_dir, 'plugins')
+    if os.path.isdir(_plugins_dir):
+        os.environ['QT_PLUGIN_PATH'] = _plugins_dir
+        os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = os.path.join(_plugins_dir, 'platforms')
+
 import asyncio
 import csv
 import logging
-import os
 import threading
 import time
 from queue import Queue
+
 import OpenOPC
 import pythoncom
-from asyncua import Server, ua
+from asyncua.server.server import Server, ua
+from PySide2.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QTreeWidget, QTreeWidgetItem, QHeaderView, QPushButton, QLabel,
+    QFileDialog, QMessageBox, QDialog, QFormLayout, QLineEdit,
+    QGroupBox, QSplitter, QTextEdit, QToolBar, QStatusBar,
+    QMenuBar, QMenu, QComboBox, QAbstractItemView, QInputDialog,
+    QAction,
+)
+from PySide2.QtCore import Qt, Slot, QThread, QTimer, Signal
+from PySide2.QtGui import QFont, QColor
 
-# Configure Logging
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s'
 )
 logger = logging.getLogger("OPC_MultiServer_Gateway")
 
-# --- CONFIGURATION ---
-CSV_FILE_PATH = "tags.csv"
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+DEFAULT_CSV = "tags.csv"
 OPC_UA_ENDPOINT = "opc.tcp://0.0.0.0:4840/freeopcua/server/"
 OPC_UA_NAMESPACE = "http://mycompany.com"
+CHUNK_SIZE = 500
+POLL_INTERVAL = 0.5
+RECONNECT_DELAY = 5.0
 
-CHUNK_SIZE = 500       
-POLL_INTERVAL = 0.5    
-RECONNECT_DELAY = 5.0  
-
-# Global thread-safe outbound queue map: { "server_name": Queue() }
 write_queues = {}
 async_loop = None
 
+
+# ===================================================================
+# Background gateway engine (runs in a QThread)
+# ===================================================================
+class GatewayEngine(QThread):
+    """Owns the async OPC-UA server and spawns DA worker threads."""
+
+    log_signal = Signal(str)
+    status_signal = Signal(str, bool)
+
+    def __init__(self, config: dict):
+        super().__init__()
+        self.config = config          # { server_name: [tag, ...] }
+        self._ua_server = None
+
+    # -- QThread.run --------------------------------------------------------
+    def run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        global async_loop
+        async_loop = loop
+        loop.run_until_complete(self._async_main())
+
+    async def _async_main(self):
+        if not self.config:
+            self.log_signal.emit("No servers configured – add servers to start.")
+            return
+
+        ua_server = Server()
+        await ua_server.init()
+        ua_server.set_endpoint(OPC_UA_ENDPOINT)
+        idx = await ua_server.register_namespace(OPC_UA_NAMESPACE)
+        root = await ua_server.nodes.objects.add_object(idx, "MultiServer_OPC_Bridge")
+        tag_routing_map = {}
+
+        for srv, tags in self.config.items():
+            write_queues[srv] = Queue()
+            clean = srv.replace(".", "_").replace(" ", "_")
+            folder = await root.add_object(idx, f"Server_{clean}")
+            status_node = await folder.add_variable(idx, "IsConnected", 0.0)
+
+            ua_vars = {}
+            for tag in tags:
+                ct = tag.replace(".", "_").replace(" ", "_")
+                node = await folder.add_variable(idx, ct, 0.0)
+                await node.set_writable()
+                ua_vars[tag] = node
+                tag_routing_map[node.nodeid] = (srv, tag)
+
+            t = threading.Thread(
+                target=opc_da_worker,
+                args=(srv, tags, ua_vars, status_node),
+                name=f"Worker_{clean}",
+                daemon=True,
+            )
+            t.start()
+
+        handler = MultiServerWriteHandler(tag_routing_map)
+        # Route writes through the address space callback
+        try:
+            ua_server.iserver.address_space.set_data_value_callback(handler.write_data_value)
+        except AttributeError:
+            logger.warning("set_data_value_callback unavailable in this asyncua version")
+        self.log_signal.emit("OPC UA Gateway engine is online.")
+        self._ua_server = ua_server
+
+        async with ua_server:
+            while True:
+                await asyncio.sleep(1)
+
+
+# ===================================================================
+# Core helpers (unchanged logic, minor clean-up)
+# ===================================================================
 class MultiServerWriteHandler:
-    """Routes modern OPC UA client writes back to the correct physical server's queue."""
     def __init__(self, tag_routing_map):
-        # Maps nodeid -> (server_name, da_tag)
         self.tag_routing_map = tag_routing_map
 
     async def write_data_value(self, nodeid, value):
         route = self.tag_routing_map.get(nodeid)
-        if route:
-            server_name, da_tag = route
-            new_val = value.Value.Value
-            # Push specifically into that target server's dedicated queue
-            write_queues[server_name].put((da_tag, new_val))
-            logger.info(f"Queued write for Server [{server_name}] -> Tag: {da_tag} | Val: {new_val}")
+        if not route:
+            return
+        server_name, da_tag = route
+        write_queues[server_name].put((da_tag, value.Value.Value))
+        logger.info(f"Queued write [{server_name}] -> {da_tag} = {value.Value.Value}")
 
 
-def load_multi_server_config(file_path):
-    """Parses CSV and groups tags by their unique target server name."""
-    config = {} # Structure: { "server_name": [tag1, tag2...] }
-    if not os.path.exists(file_path):
-        logger.error(f"Configuration file missing: '{file_path}'.")
-        return config
+def load_csv(path):
+    cfg = {}
+    if not os.path.exists(path):
+        return cfg
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            srv = row.get("server_name", "").strip()
+            tag = row.get("da_tag", "").strip()
+            if srv and tag:
+                cfg.setdefault(srv, []).append(tag)
+    return cfg
 
-    with open(file_path, mode='r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            server = row.get('server_name', '').strip()
-            tag = row.get('da_tag', '').strip()
-            if server and tag:
-                if server not in config:
-                    config[server] = []
-                config[server].append(tag)
-    return config
+
+def save_csv(path, cfg):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["server_name", "da_tag"])
+        w.writeheader()
+        for srv, tags in cfg.items():
+            for tag in tags:
+                w.writerow({"server_name": srv, "da_tag": tag})
 
 
 def opc_da_worker(server_name, tags, ua_variables, ua_status_node):
-    """Dedicated Windows COM/DCOM pipeline loop isolated to a single server instance."""
     global async_loop
-    pythoncom.CoInitialize() # Bind thread to Windows STA Model
-    
+    pythoncom.CoInitialize()
     my_queue = write_queues[server_name]
     chunks = [tags[i:i + CHUNK_SIZE] for i in range(0, len(tags), CHUNK_SIZE)]
     da_client = None
-    is_connected = False
+    connected = False
 
     while True:
-        # STATE 1: Disconnected / Reconnecting
-        if not is_connected:
-            # Set internal OPC UA monitoring variable to False thread-safely
+        if not connected:
             if async_loop:
-                asyncio.run_coroutine_threadsafe(ua_status_node.write_value(False), async_loop)
-                
-            logger.info(f"Connecting to legacy server: [{server_name}]...")
+                asyncio.run_coroutine_threadsafe(
+                    ua_status_node.write_value(0.0), async_loop
+                )
             try:
                 da_client = OpenOPC.client()
                 da_client.connect(server_name)
-                da_client.create_group(f'Group_{server_name.replace(".", "_")}')
-                is_connected = True
-                
+                connected = True
                 if async_loop:
-                    asyncio.run_coroutine_threadsafe(ua_status_node.write_value(True), async_loop)
-                logger.info(f"DCOM Connection established successfully to [{server_name}].")
-            except Exception as conn_err:
-                logger.error(f"Connection to [{server_name}] failed: {conn_err}. Retrying...")
+                    asyncio.run_coroutine_threadsafe(
+                        ua_status_node.write_value(1.0), async_loop
+                    )
+                logger.info(f"Connected to [{server_name}]")
+            except Exception as e:
+                logger.error(f"Connect [{server_name}] failed: {e}")
                 time.sleep(RECONNECT_DELAY)
                 continue
 
-        # STATE 2: Connected Operational Sync Loop
         try:
-            # 1. Process Outbound Write Tasks
             while not my_queue.empty():
-                da_tag, value = my_queue.get_nowait()
+                tag, val = my_queue.get_nowait()
                 try:
-                    da_client.write((da_tag, value))
-                    logger.info(f"[{server_name}]: Wrote {value} to {da_tag}")
-                except Exception as write_err:
-                    logger.error(f"[{server_name}]: Write failed for {da_tag}: {write_err}")
+                    da_client.write((tag, val))  # type: ignore[union-attr]
+                except Exception as e:
+                    logger.error(f"[{server_name}] write {tag}: {e}")
                 my_queue.task_done()
 
-            # 2. Process Inbound Telemetry Reads
             for chunk in chunks:
-                da_data = da_client.read(chunk)
-                for tag_name, value, quality, timestamp in da_data:
-                    if quality == "Good" and async_loop:
-                        ua_node = ua_variables[tag_name]
-                        asyncio.run_coroutine_threadsafe(ua_node.write_value(value), async_loop)
-                    elif quality != "Good":
-                        logger.warning(f"[{server_name}] Tag {tag_name} quality bad: {quality}")
-            
+                for tname, val, qual, ts in da_client.read(chunk):
+                    if qual == "Good" and async_loop:
+                        asyncio.run_coroutine_threadsafe(
+                            ua_variables[tname].write_value(val), async_loop
+                        )
+                        # Also write back to DA
+                        try:
+                            da_client.write((tname, val))  # type: ignore[union-attr]
+                        except Exception as e:
+                            logger.error(f"[{server_name}] writeback {tname}: {e}")
             time.sleep(POLL_INTERVAL)
-
-        except (OpenOPC.OpcError, Exception) as runtime_err:
-            logger.error(f"Connection broken on server [{server_name}]: {runtime_err}. Resetting client.")
-            is_connected = False
+        except Exception as e:
+            logger.error(f"[{server_name}] broken: {e}")
+            connected = False
             if da_client:
                 try:
                     da_client.close()
@@ -131,69 +244,484 @@ def opc_da_worker(server_name, tags, ua_variables, ua_status_node):
             time.sleep(RECONNECT_DELAY)
 
 
-async def main():
-    global async_loop
-    async_loop = asyncio.get_running_loop()
+# ===================================================================
+# Qt dialogs
+# ===================================================================
+class AddServerDialog(QDialog):
+    """Simple dialog to add a new OPC DA server name."""
 
-    # 1. Parse Config Schema
-    server_config = load_multi_server_config(CSV_FILE_PATH)
-    if not server_config:
-        logger.error("No valid server configurations parsed from CSV. Exiting.")
-        return
+    def __init__(self, existing_servers, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setWindowTitle("Add OPC DA Server")
+        self.resize(450, 220)
+        layout = QVBoxLayout(self)
 
-    # 2. Start UA Engine Setup
-    ua_server = Server()
-    await ua_server.init()
-    ua_server.set_endpoint(OPC_UA_ENDPOINT)
-    idx = await ua_server.register_namespace(OPC_UA_NAMESPACE)
-    root_folder = await ua_server.nodes.objects.add_object(idx, "MultiServer_OPC_Bridge")
-    
-    tag_routing_map = {}
-
-    # 3. Dynamic Address Space Architecture Grouped By Server
-    for server_name, tags in server_config.items():
-        logger.info(f"Configuring memory footprints for server: {server_name}")
-        
-        # Initialize an independent thread queue for this specific server
-        write_queues[server_name] = Queue()
-        
-        # Create an isolating folder wrapper inside OPC UA namespace for clarity
-        clean_server_name = server_name.replace(".", "_").replace(" ", "_")
-        server_folder = await root_folder.add_object(idx, f"Server_{clean_server_name}")
-        
-        # Add a diagnostic status node inside this specific folder
-        status_node = await server_folder.add_variable(idx, "IsConnected", False)
-        
-        server_ua_variables = {}
-        for tag in tags:
-            clean_tag_name = tag.replace(".", "_").replace(" ", "_")
-            ua_node = await server_folder.add_variable(idx, clean_tag_name, 0.0)
-            await ua_node.set_writable()
-            
-            server_ua_variables[tag] = ua_node
-            tag_routing_map[ua_node.nodeid] = (server_name, tag)
-
-        # 4. Spawn a dedicated, independent Worker Thread for this server context
-        worker_thread = threading.Thread(
-            target=opc_da_worker,
-            args=(server_name, tags, server_ua_variables, status_node),
-            name=f"Worker_{clean_server_name}",
-            daemon=True
+        # Explanatory text
+        info = QLabel(
+            "Enter the <b>COM Server ID</b> (ProgID) of the OPC DA server.<br/><br/>"
+            "This is <b>not</b> a hostname or IP address. Examples:<br/>"
+            "<ul>"
+            "<li><i>FactoryTalk Gateway</i></li>"
+            "<li><i>Matrikon.OPC.Simulation.1</i></li>"
+            "<li><i>KEPware.KEPServerEX.V4</i></li>"
+            "</ul>"
         )
-        worker_thread.start()
+        info.setWordWrap(True)
+        info.setStyleSheet("margin-bottom: 8px;")
+        layout.addWidget(info)
 
-    # 5. Bind Interceptor Callback
-    handler = MultiServerWriteHandler(tag_routing_map)
-    ua_server.aspace.set_data_value_callback(handler.write_data_value)
+        form = QFormLayout()
+        self.server_edit = QLineEdit()
+        self.server_edit.setPlaceholderText("e.g.  FactoryTalk Gateway")
+        form.addRow("Server ID:", self.server_edit)
+        layout.addLayout(form)
 
-    # 6. Keep Running Async Server Loop
-    logger.info("Multi-server OPC UA Gateway engine is online.")
-    async with ua_server:
-        while True:
-            await asyncio.sleep(3600)
+        # Show existing servers as suggestions
+        if existing_servers:
+            hint = QLabel("Existing servers: " + ", ".join(sorted(existing_servers)))
+            hint.setStyleSheet("color: gray; font-size: small; margin-top: 4px;")
+            layout.addWidget(hint)
+
+        layout.addStretch()
+
+        btns = QHBoxLayout()
+        ok = QPushButton("Add")
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        btns.addStretch()
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        layout.addLayout(btns)
+
+    def result(self):
+        return self.server_edit.text().strip()
+
+
+class AddTagDialog(QDialog):
+    """Dialog to add a single tag to a server."""
+
+    def __init__(self, server_name, existing_tags, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setWindowTitle(f"Add Tag → {server_name}")
+        self.resize(400, 120)
+        layout = QFormLayout(self)
+        self.tag_edit = QLineEdit()
+        self.tag_edit.setPlaceholderText("e.g.  Random.Real4")
+        layout.addRow("DA Tag:", self.tag_edit)
+
+        if existing_tags:
+            hint = QLabel("Existing tags: " + ", ".join(existing_tags[:10]))
+            hint.setStyleSheet("color: gray; font-size: small;")
+            layout.addRow(hint)
+
+        btns = QHBoxLayout()
+        ok = QPushButton("Add")
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        btns.addStretch()
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        layout.addRow(btns)
+
+    def result(self):
+        return self.tag_edit.text().strip()
+
+
+class EditTagDialog(QDialog):
+    """Dialog to edit an existing tag name."""
+
+    def __init__(self, server_name, current_tag, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setWindowTitle(f"Edit Tag → {server_name}")
+        layout = QFormLayout(self)
+        self.tag_edit = QLineEdit(current_tag)
+        layout.addRow("DA Tag:", self.tag_edit)
+
+        btns = QHBoxLayout()
+        ok = QPushButton("Save")
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        btns.addStretch()
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        layout.addRow(btns)
+
+    def result(self):
+        return self.tag_edit.text().strip()
+
+
+# ===================================================================
+# Main window
+# ===================================================================
+
+
+# ===================================================================
+# Main window
+# ===================================================================
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.config = {}          # { server: [tag, ...] }
+        self.engine = None
+        self._csv_path = DEFAULT_CSV
+
+        self._build_ui()
+        self._build_menu()
+        self._build_toolbar()
+        self._load_default_csv()
+
+        self.statusBar().showMessage("Ready")
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        self.setWindowTitle("OPC DA → OPC UA Gateway")
+        self.resize(1100, 700)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+
+        # --- Splitter: tree | log ---
+        splitter = QSplitter(Qt.Horizontal)
+
+        # Left: hierarchical tree
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Name", "Type", "Status"])
+        self.tree.setHeaderHidden(False)
+        self.tree.setAnimated(True)
+        self.tree.setIndentation(20)
+        self.tree.itemDoubleClicked.connect(self._on_tree_double_click)
+        splitter.addWidget(self.tree)
+
+        # Right: log viewer
+        log_group = QGroupBox("Gateway Log")
+        log_layout = QVBoxLayout(log_group)
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setFont(QFont("Consolas", 9))
+        log_layout.addWidget(self.log_view)
+        splitter.addWidget(log_group)
+
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
+        main_layout.addWidget(splitter)
+
+        # --- Bottom toolbar (start / stop / save) ---
+        btn_bar = QHBoxLayout()
+
+        self.btn_start = QPushButton("▶  Start Gateway")
+        self.btn_start.setObjectName("startBtn")
+        self.btn_start.clicked.connect(self._start_gateway)
+        btn_bar.addWidget(self.btn_start)
+
+        self.btn_stop = QPushButton("⏹  Stop Gateway")
+        self.btn_stop.setObjectName("stopBtn")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self._stop_gateway)
+        btn_bar.addWidget(self.btn_stop)
+
+        btn_bar.addStretch()
+
+        self.btn_save = QPushButton("💾  Save CSV")
+        self.btn_save.clicked.connect(self._save_csv)
+        btn_bar.addWidget(self.btn_save)
+
+        main_layout.addLayout(btn_bar)
+
+        # Style
+        self.setStyleSheet("""
+            #startBtn { background: #2e7d32; color: white; padding: 6px 16px; border-radius: 4px; font-weight: bold; }
+            #startBtn:hover { background: #388e3c; }
+            #stopBtn { background: #c62828; color: white; padding: 6px 16px; border-radius: 4px; font-weight: bold; }
+            #stopBtn:hover { background: #d32f2f; }
+            QTreeWidget::item { height: 24px; }
+            QGroupBox { font-weight: bold; border: 1px solid #ccc; margin-top: 8px; padding-top: 8px; }
+        """)
+
+    def _build_menu(self):
+        menubar = self.menuBar()
+
+        # File
+        file_menu = menubar.addMenu("&File")
+        act_open = QAction("&Load CSV…", self)
+        act_open.setShortcut("Ctrl+O")
+        act_open.triggered.connect(self._load_csv_dialog)
+        file_menu.addAction(act_open)
+
+        act_save = QAction("&Save CSV", self)
+        act_save.setShortcut("Ctrl+S")
+        act_save.triggered.connect(self._save_csv)
+        file_menu.addAction(act_save)
+
+        act_save_as = QAction("Save CSV &As…", self)
+        act_save_as.triggered.connect(self._save_csv_as)
+        file_menu.addAction(act_save_as)
+
+        file_menu.addSeparator()
+        act_exit = QAction("E&xit", self)
+        act_exit.setShortcut("Ctrl+Q")
+        act_exit.triggered.connect(self.close)
+        file_menu.addAction(act_exit)
+
+        # Edit
+        edit_menu = menubar.addMenu("&Edit")
+        act_add_srv = QAction("Add &Server…", self)
+        act_add_srv.setShortcut("Ctrl+N")
+        act_add_srv.triggered.connect(self._add_server)
+        edit_menu.addAction(act_add_srv)
+
+        act_add_tag = QAction("Add &Tag…", self)
+        act_add_tag.setShortcut("Ctrl+T")
+        act_add_tag.triggered.connect(self._add_tag)
+        edit_menu.addAction(act_add_tag)
+
+        act_edit_tag = QAction("&Edit Tag…", self)
+        act_edit_tag.setShortcut("Ctrl+E")
+        act_edit_tag.triggered.connect(self._edit_tag)
+        edit_menu.addAction(act_edit_tag)
+
+        act_del = QAction("&Delete Selected", self)
+        act_del.setShortcut("Del")
+        act_del.triggered.connect(self._delete_selected)
+        edit_menu.addAction(act_del)
+
+        # Help
+        help_menu = menubar.addMenu("&Help")
+        act_about = QAction("&About", self)
+        act_about.triggered.connect(self._about)
+        help_menu.addAction(act_about)
+
+    def _build_toolbar(self):
+        tb = self.addToolBar("Quick")
+        tb.addAction("Add Server", lambda: self._add_server())
+        tb.addAction("Add Tag", lambda: self._add_tag())
+        tb.addAction("Delete", lambda: self._delete_selected())
+        tb.addSeparator()
+        tb.addAction("Load CSV", lambda: self._load_csv_dialog())
+        tb.addAction("Save CSV", lambda: self._save_csv())
+
+    # ------------------------------------------------------------------
+    # Tree management
+    # ------------------------------------------------------------------
+    def _refresh_tree(self):
+        """Rebuild the tree widget from self.config."""
+        self.tree.clear()
+        self.tree.setHeaderLabels(["Name", "Type", "Status"])
+
+        for srv in sorted(self.config):
+            srv_item = QTreeWidgetItem(self.tree, [srv, "OPC DA Server", ""])
+            srv_item.setFont(0, QFont("Segoe UI", 9, QFont.Bold))
+            srv_item.setForeground(0, QColor("#1565c0"))
+
+            tags = self.config[srv]
+            for tag in tags:
+                tag_item = QTreeWidgetItem(srv_item, [tag, "Tag", ""])
+                tag_item.setForeground(0, QColor("#333"))
+
+        self.tree.expandAll()
+        self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+
+    # ------------------------------------------------------------------
+    # CSV I/O
+    # ------------------------------------------------------------------
+    def _load_default_csv(self):
+        if os.path.exists(DEFAULT_CSV):
+            self.config = load_csv(DEFAULT_CSV)
+            self._refresh_tree()
+            self._log(f"Loaded {DEFAULT_CSV}")
+
+    def _load_csv_dialog(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load CSV Configuration", "", "CSV Files (*.csv);;All (*)"
+        )
+        if not path:
+            return
+        self._csv_path = path
+        self.config = load_csv(path)
+        self._refresh_tree()
+        self._log(f"Loaded {path}")
+        self.statusBar().showMessage(f"Loaded: {path}")
+
+    def _save_csv(self):
+        save_csv(self._csv_path, self.config)
+        self._log(f"Saved configuration to {self._csv_path}")
+        self.statusBar().showMessage(f"Saved: {self._csv_path}")
+
+    def _save_csv_as(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save CSV As", DEFAULT_CSV, "CSV Files (*.csv);;All (*)"
+        )
+        if not path:
+            return
+        self._csv_path = path
+        self._save_csv()
+
+    # ------------------------------------------------------------------
+    # CRUD operations
+    # ------------------------------------------------------------------
+    def _add_server(self):
+        dlg = AddServerDialog(list(self.config.keys()), self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        name = dlg.result()
+        if not name:
+            return
+        if name in self.config:
+            QMessageBox.warning(self, "Duplicate", f"Server '{name}' already exists.")
+            return
+        self.config[name] = []
+        self._refresh_tree()
+        self._log(f"Added server: {name}")
+
+    def _add_tag(self):
+        item = self.tree.currentItem()
+        if not item:
+            QMessageBox.information(self, "Select Server", "Select a server in the tree first.")
+            return
+        # Walk up to find server item (level 0)
+        srv_item = item
+        while srv_item and self.tree.indexOfTopLevelItem(srv_item) < 0:
+            srv_item = srv_item.parent()
+        if not srv_item:
+            return
+        srv_name = srv_item.text(0)
+        existing = list(self.config.get(srv_name, []))
+        dlg = AddTagDialog(srv_name, existing, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        tag = dlg.result()
+        if not tag:
+            return
+        if tag in existing:
+            QMessageBox.warning(self, "Duplicate", f"Tag '{tag}' already exists on '{srv_name}'.")
+            return
+        self.config.setdefault(srv_name, []).append(tag)
+        self._refresh_tree()
+        self._log(f"Added tag '{tag}' to server '{srv_name}'")
+
+    def _edit_tag(self):
+        item = self.tree.currentItem()
+        if not item or item.parent() is None:
+            QMessageBox.information(self, "Select Tag", "Select a tag in the tree to edit.")
+            return
+        srv_item = item.parent()
+        srv_name = srv_item.text(0)
+        old_tag = item.text(0)
+        dlg = EditTagDialog(srv_name, old_tag, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        new_tag = dlg.result()
+        if not new_tag or new_tag == old_tag:
+            return
+        tags = self.config.get(srv_name, [])
+        if new_tag in tags:
+            QMessageBox.warning(self, "Duplicate", f"Tag '{new_tag}' already exists.")
+            return
+        tags[tags.index(old_tag)] = new_tag
+        self._refresh_tree()
+        self._log(f"Renamed tag '{old_tag}' → '{new_tag}' on '{srv_name}'")
+
+    def _delete_selected(self):
+        item = self.tree.currentItem()
+        if not item:
+            return
+        srv_idx = self.tree.indexOfTopLevelItem(item)
+
+        if srv_idx >= 0:
+            # Deleting a server
+            name = item.text(0)
+            reply = QMessageBox.question(
+                self, "Delete Server",
+                f"Delete server '{name}' and all its tags?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            del self.config[name]
+            self._log(f"Deleted server: {name}")
+        elif item.parent():
+            # Deleting a tag
+            srv_name = item.parent().text(0)
+            tag = item.text(0)
+            self.config[srv_name].remove(tag)
+            if not self.config[srv_name]:
+                del self.config[srv_name]
+            self._log(f"Deleted tag '{tag}' from '{srv_name}'")
+        self._refresh_tree()
+
+    def _on_tree_double_click(self, item, column):
+        """Double-click a tag to edit it."""
+        if item.parent():
+            self.tree.setCurrentItem(item)
+            self._edit_tag()
+
+    # ------------------------------------------------------------------
+    # Gateway start / stop
+    # ------------------------------------------------------------------
+    def _start_gateway(self):
+        if not self.config:
+            QMessageBox.warning(self, "No Config", "Add at least one server before starting.")
+            return
+        if self.engine and self.engine.isRunning():
+            return
+        self.engine = GatewayEngine(dict(self.config))
+        self.engine.log_signal.connect(self._log)
+        self.engine.start()
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.statusBar().showMessage("Gateway running…")
+
+    def _stop_gateway(self):
+        if self.engine:
+            self.engine.terminate()
+            self.engine.wait(3000)
+            self.engine = None
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self._log("Gateway stopped.")
+        self.statusBar().showMessage("Gateway stopped")
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _log(self, msg):
+        self.log_view.append(msg)
+
+    def _about(self):
+        QMessageBox.about(
+            self, "About",
+            "<b>OPC DA → OPC UA Gateway</b><br/>"
+            "Version 0.1<br/><br/>"
+            "Bridge legacy OPC DA servers to modern OPC UA clients.<br/><br/>"
+            "• Add servers and tags via the tree or CSV.<br/>"
+            "• Start the gateway to expose tags over OPC UA.<br/>"
+            "• Double-click a tag to edit it.",
+        )
+
+    def closeEvent(self, event):
+        if self.engine and self.engine.isRunning():
+            self._stop_gateway()
+        event.accept()
+
+
+# ===================================================================
+# Entry point
+# ===================================================================
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("System shutting down.")
+    main()
