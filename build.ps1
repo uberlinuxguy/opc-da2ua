@@ -30,7 +30,7 @@ Write-Host "[1/5] Checking for 32-bit Python 3.8..." -ForegroundColor Yellow
 $python38_paths = @(
     "$env:LOCALAPPDATA\Programs\Python\Python38-32\python.exe",
     "C:\Python38-32\python.exe",
-    "C:\Program Files\Python38-32\python.exe"
+    "C:\Program Files (x86)\Python38-32\python.exe"
 )
 
 $python38_exe = $null
