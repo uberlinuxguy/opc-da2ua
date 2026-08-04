@@ -4,11 +4,16 @@
 
 $ErrorActionPreference = "Stop"
 
-# Check for "clean" argument
+# Check for arguments
 $Clean = $args -contains "clean"
+$VenvOnly = $args -contains "venv"
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  OPC DA-to-UA Gateway Build" -ForegroundColor Cyan
+if ($VenvOnly) {
+    Write-Host "  OPC DA-to-UA Gateway (Venv Setup Only)" -ForegroundColor Cyan
+} else {
+    Write-Host "  OPC DA-to-UA Gateway Build" -ForegroundColor Cyan
+}
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -93,6 +98,22 @@ Write-Host "  Installing Nuitka $NUITKA_VERSION..." -ForegroundColor Gray
 & $PYTHON_EXE -m pip install "nuitka==$NUITKA_VERSION" --quiet
 
 Write-Host "  Dependencies installed." -ForegroundColor Green
+
+# If "venv" argument was passed, stop here
+if ($VenvOnly) {
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host "  Virtual environment ready!" -ForegroundColor Green
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "To activate the venv:" -ForegroundColor Yellow
+    Write-Host "  .\$VENV_DIR\Scripts\Activate.ps1" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "To run the application:" -ForegroundColor Yellow
+    Write-Host "  .\$VENV_DIR\Scripts\python.exe opc_da2ua.py" -ForegroundColor Cyan
+    Write-Host ""
+    exit 0
+}
 
 # ------------------------------------------------------------------
 # Step 4: Clean previous build (only if "clean" is passed)
