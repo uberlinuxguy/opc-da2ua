@@ -37,9 +37,10 @@ import csv
 import json
 import logging
 import signal
+import ssl
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from queue import Queue
 
 import OpenOPC
@@ -120,6 +121,8 @@ DEFAULT_FOLDER = "Default"
 
 write_queues = {}
 async_loop = None
+CERT_FILE = "server_cert.pem"
+KEY_FILE = "server_key.pem"
 
 
 # ---------------------------------------------------------------------------
@@ -216,12 +219,20 @@ class GatewayEngine(QThread):
             self.log_signal.emit("No servers configured – add servers to start.")
             return
 
+        # Generate and load self-signed certificate
+        _ensure_self_signed_cert()
         ua_server = Server()
         await ua_server.init()
         ua_server.set_endpoint(OPC_UA_ENDPOINT)
+        try:
+            await ua_server.load_certificate(CERT_FILE)
+            await ua_server.load_private_key(KEY_FILE)
+        except Exception as e:
+            logger.warning(f"Could not load certificate: {e}")
         root_idx = await ua_server.register_namespace(OPC_UA_NAMESPACE)
         root = await ua_server.nodes.objects.add_object(root_idx, "MultiServer_OPC_Bridge")
         tag_routing_map = {}
+        ua_vars = {}  # Collect all UA variables across all servers
 
         for srv, folders in self.config.items():
             write_queues[srv] = Queue()
@@ -230,7 +241,7 @@ class GatewayEngine(QThread):
             status_node = await srv_node.add_variable(root_idx, "IsConnected", 0.0)
 
             all_tags = []
-            ua_vars = {}
+            srv_ua_vars = {}  # Per-server subset for the worker thread
 
             # Collect all tags first so we can probe types
             for folder, tags in folders.items():
@@ -255,22 +266,23 @@ class GatewayEngine(QThread):
                     node = await folder_node.add_variable(ns_idx, ct, default_val, vtype)
                     await node.set_writable()
                     ua_vars[tag] = node
+                    srv_ua_vars[tag] = node
                     tag_routing_map[node.nodeid] = (srv, tag)
 
             t = threading.Thread(
                 target=opc_da_worker,
-                args=(srv, all_tags, ua_vars, status_node),
+                args=(srv, all_tags, srv_ua_vars, status_node),
                 name=f"Worker_{clean}",
                 daemon=True,
             )
             t.start()
 
         handler = MultiServerWriteHandler(tag_routing_map)
-        # Route writes through the address space callback
-        try:
-            ua_server.iserver.address_space.set_data_value_callback(handler.write_data_value)
-        except AttributeError:
-            logger.warning("set_data_value_callback unavailable in this asyncua version")
+        # Start a background monitor for UA write requests (asyncua 1.1.0 lacks
+        # set_data_value_callback, so we poll the variables for external writes)
+        self._write_monitor_task = asyncio.create_task(
+            _ua_write_monitor(ua_server, ua_vars, handler, self._stop_event)
+        )
         self.log_signal.emit("OPC UA Gateway engine is online.")
         self._ua_server = ua_server
 
@@ -278,6 +290,13 @@ class GatewayEngine(QThread):
             while not self._stop_event.is_set():
                 await asyncio.sleep(0.5)
             self.log_signal.emit("Shutdown requested – stopping server...")
+            # Cancel the write monitor task
+            if hasattr(self, '_write_monitor_task'):
+                self._write_monitor_task.cancel()
+                try:
+                    await self._write_monitor_task
+                except asyncio.CancelledError:
+                    pass
         self.log_signal.emit("OPC UA server stopped.")
 
 
@@ -295,6 +314,47 @@ class MultiServerWriteHandler:
         server_name, da_tag = route
         write_queues[server_name].put((da_tag, value.Value.Value))
         logger.info(f"Queued write [{server_name}] -> {da_tag} = {value.Value.Value}")
+
+    def route_write(self, nodeid, val):
+        """Synchronous version for the polling monitor."""
+        route = self.tag_routing_map.get(nodeid)
+        if not route:
+            return
+        server_name, da_tag = route
+        write_queues[server_name].put((da_tag, val))
+        logger.info(f"Queued write [{server_name}] -> {da_tag} = {val}")
+
+
+async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event):
+    """Poll UA variables for externally-written values and route them to DA.
+
+    asyncua 1.1.0 does not have set_data_value_callback on the address space,
+    so we periodically read each variable's value and compare it against the
+    last known value. When a difference is detected we assume a UA client
+    wrote to it and forward the value to the DA write queue.
+    """
+    # Snapshot of last-known values per node
+    last_values = {}
+    poll_interval = 0.25  # seconds
+    while not stop_event.is_set():
+        await asyncio.sleep(poll_interval)
+        try:
+            for da_tag, node in ua_vars.items():
+                nodeid = node.nodeid
+                dv = await node.read_value()
+                current = dv.Value.Value if hasattr(dv, 'Value') else dv
+                prev = last_values.get(nodeid)
+                if prev is None:
+                    last_values[nodeid] = current
+                    continue
+                # Only forward if value changed (external write)
+                if current != prev:
+                    last_values[nodeid] = current
+                    handler.route_write(nodeid, current)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"Write monitor poll error: {e}")
 
 
 def load_csv(path):
@@ -334,6 +394,51 @@ def _da_type_to_ua(val):
     if isinstance(val, datetime):
         return ua.VariantType.DateTime, datetime.min
     return ua.VariantType.Double, 0.0
+
+
+def _ensure_self_signed_cert():
+    """Generate a self-signed certificate if it doesn't already exist."""
+    if os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE):
+        return
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.backends import default_backend
+
+        key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+            backend=default_backend(),
+        )
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"OPC DA2UA Gateway"),
+            x509.NameAttribute(NameOID.COMMON_NAME, u"localhost"),
+        ])
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.utcnow())
+            .not_valid_after(datetime.utcnow() + timedelta(days=365))
+            .sign(key, hashes.SHA256(), default_backend())
+        )
+        with open(CERT_FILE, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+        with open(KEY_FILE, "wb") as f:
+            f.write(
+                key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.TraditionalOpenSSL,
+                    serialization.NoEncryption(),
+                )
+            )
+        logger.info(f"Generated self-signed certificate ({CERT_FILE})")
+    except Exception as e:
+        logger.warning(f"Could not generate certificate: {e}")
 
 
 def _probe_da_types(server_name, tags):
