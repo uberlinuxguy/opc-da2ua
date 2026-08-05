@@ -678,10 +678,10 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
 
-        # --- Splitter: tree | log ---
-        splitter = QSplitter(Qt.Horizontal)
+        # --- Splitter: tree (top) | log (bottom) ---
+        splitter = QSplitter(Qt.Vertical)
 
-        # Left: hierarchical tree
+        # Top: hierarchical tree
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Name", "Type", "Status"])
         self.tree.setHeaderHidden(False)
@@ -690,7 +690,7 @@ class MainWindow(QMainWindow):
         self.tree.itemDoubleClicked.connect(self._on_tree_double_click)
         splitter.addWidget(self.tree)
 
-        # Right: log viewer
+        # Bottom: log viewer
         log_group = QGroupBox("Gateway Log")
         log_layout = QVBoxLayout(log_group)
         self.log_view = QTextEdit()
