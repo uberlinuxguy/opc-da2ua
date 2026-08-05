@@ -201,6 +201,7 @@ class GatewayEngine(QThread):
 
     log_signal = Signal(str)
     status_signal = Signal(str, bool)
+    server_status_signal = Signal(str, bool)  # server_name, connected
 
     def __init__(self, config: dict):
         super().__init__()
@@ -283,7 +284,7 @@ class GatewayEngine(QThread):
 
             t = threading.Thread(
                 target=opc_da_worker,
-                args=(srv, all_tags, srv_ua_vars, status_node),
+                args=(srv, all_tags, srv_ua_vars, status_node, self.server_status_signal),
                 name=f"Worker_{clean}",
                 daemon=True,
             )
@@ -494,7 +495,7 @@ def _probe_da_types(server_name, tags):
     return types
 
 
-def opc_da_worker(server_name, tags, ua_variables, ua_status_node):
+def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status_signal):
     global async_loop
     pythoncom.CoInitialize()
     my_queue = write_queues[server_name]
@@ -508,6 +509,11 @@ def opc_da_worker(server_name, tags, ua_variables, ua_status_node):
                 asyncio.run_coroutine_threadsafe(
                     ua_status_node.write_value(0.0), async_loop
                 )
+            # Emit disconnected status
+            try:
+                server_status_signal.emit(server_name, False)
+            except RuntimeError:
+                pass  # Signal may be disconnected during shutdown
             try:
                 da_client = OpenOPC.client()
                 da_client.connect(server_name)
@@ -516,6 +522,11 @@ def opc_da_worker(server_name, tags, ua_variables, ua_status_node):
                     asyncio.run_coroutine_threadsafe(
                         ua_status_node.write_value(1.0), async_loop
                     )
+                # Emit connected status
+                try:
+                    server_status_signal.emit(server_name, True)
+                except RuntimeError:
+                    pass
                 logger.info(f"Connected to [{server_name}]")
             except Exception as e:
                 logger.error(f"Connect [{server_name}] failed: {e}")
@@ -546,6 +557,11 @@ def opc_da_worker(server_name, tags, ua_variables, ua_status_node):
         except Exception as e:
             logger.error(f"[{server_name}] broken: {e}")
             connected = False
+            # Emit disconnected status
+            try:
+                server_status_signal.emit(server_name, False)
+            except RuntimeError:
+                pass
             if da_client:
                 try:
                     da_client.close()
@@ -830,6 +846,8 @@ class MainWindow(QMainWindow):
         self.engine = None
         self._csv_path = DEFAULT_CSV
         self.prefs = {}
+        self._server_status = {}  # { server_name: bool }
+        self._server_tree_items = {}  # { server_name: QTreeWidgetItem }
 
         self._build_ui()
         self._build_menu()
@@ -992,11 +1010,14 @@ class MainWindow(QMainWindow):
         """Rebuild the tree widget from self.config."""
         self.tree.clear()
         self.tree.setHeaderLabels(["Name", "Type", "Status"])
+        self._server_tree_items = {}
 
         for srv in sorted(self.config):
-            srv_item = QTreeWidgetItem(self.tree, [srv, "OPC DA Server", ""])
+            status = "Good" if self._server_status.get(srv, False) else "Bad"
+            srv_item = QTreeWidgetItem(self.tree, [srv, "OPC DA Server", status])
             srv_item.setFont(0, QFont("Segoe UI", 9, QFont.Bold))
             srv_item.setForeground(0, QColor("#1565c0"))
+            self._server_tree_items[srv] = srv_item
 
             folders = self.config[srv]
             for folder in sorted(folders):
@@ -1197,7 +1218,12 @@ class MainWindow(QMainWindow):
         self.engine.setObjectName("OPCUA-1")
         self.engine.config["__ssl_enabled__"] = self.prefs.get("ssl_enabled", DEFAULT_SSL_ENABLED)
         self.engine.log_signal.connect(self._log)
+        self.engine.server_status_signal.connect(self._on_server_status_changed)
         self.engine.start()
+        # Reset status for all servers when starting
+        for srv in self.config:
+            self._server_status[srv] = False
+        self._update_server_status_colors()
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.statusBar().showMessage("Gateway running…")
@@ -1220,6 +1246,22 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _log(self, msg):
         self.log_view.append(msg)
+
+    def _on_server_status_changed(self, server_name, connected):
+        """Update server status in the tree when connection state changes."""
+        self._server_status[server_name] = connected
+        self._update_server_status_colors()
+
+    def _update_server_status_colors(self):
+        """Update status column and colors for all server items in the tree."""
+        for srv, item in self._server_tree_items.items():
+            connected = self._server_status.get(srv, False)
+            if connected:
+                item.setText(2, "Good")
+                item.setForeground(2, QColor("#2e7d32"))  # Green
+            else:
+                item.setText(2, "Bad")
+                item.setForeground(2, QColor("#c62828"))  # Red
 
     def _open_preferences(self):
         dlg = PreferencesDialog(self)
