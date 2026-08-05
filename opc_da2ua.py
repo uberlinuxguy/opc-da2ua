@@ -36,6 +36,7 @@ import asyncio
 import csv
 import json
 import logging
+import signal
 import threading
 import time
 from datetime import datetime
@@ -200,6 +201,7 @@ class GatewayEngine(QThread):
         super().__init__()
         self.config = config          # { server_name: { folder: [tag, ...] } }
         self._ua_server = None
+        self._stop_event = threading.Event()
 
     # -- QThread.run --------------------------------------------------------
     def run(self):
@@ -273,8 +275,10 @@ class GatewayEngine(QThread):
         self._ua_server = ua_server
 
         async with ua_server:
-            while True:
-                await asyncio.sleep(1)
+            while not self._stop_event.is_set():
+                await asyncio.sleep(0.5)
+            self.log_signal.emit("Shutdown requested – stopping server...")
+        self.log_signal.emit("OPC UA server stopped.")
 
 
 # ===================================================================
@@ -1020,8 +1024,11 @@ class MainWindow(QMainWindow):
 
     def _stop_gateway(self):
         if self.engine:
-            self.engine.terminate()
-            self.engine.wait(3000)
+            self.engine._stop_event.set()
+            self.engine.wait(5000)
+            if self.engine.isRunning():
+                self.engine.terminate()
+                self.engine.wait(3000)
             self.engine = None
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
@@ -1072,6 +1079,12 @@ def main():
     app.setStyle("Fusion")
     win = MainWindow()
     win.show()
+
+    # Handle Ctrl-C gracefully by triggering the window close event
+    def _handle_sigint(signum, frame):
+        win.close()
+    signal.signal(signal.SIGINT, _handle_sigint)
+
     sys.exit(app.exec_())
 
 
