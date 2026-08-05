@@ -226,7 +226,7 @@ class GatewayEngine(QThread):
         _ensure_self_signed_cert()
         ua_server = Server()
         await ua_server.init()
-        ua_server.set_application_name("OPCUA-1")
+        ua_server.set_server_name("OPCUA-1")
         ua_server.set_endpoint(OPC_UA_ENDPOINT)
         if ssl_enabled:
             try:
