@@ -71,6 +71,7 @@ OPC_UA_NAMESPACE = "http://mycompany.com"
 CHUNK_SIZE = 500
 POLL_INTERVAL = 0.5
 RECONNECT_DELAY = 5.0
+DEFAULT_FOLDER = "Default"
 
 write_queues = {}
 async_loop = None
@@ -87,7 +88,7 @@ class GatewayEngine(QThread):
 
     def __init__(self, config: dict):
         super().__init__()
-        self.config = config          # { server_name: [tag, ...] }
+        self.config = config          # { server_name: { folder: [tag, ...] } }
         self._ua_server = None
 
     # -- QThread.run --------------------------------------------------------
@@ -106,27 +107,38 @@ class GatewayEngine(QThread):
         ua_server = Server()
         await ua_server.init()
         ua_server.set_endpoint(OPC_UA_ENDPOINT)
-        idx = await ua_server.register_namespace(OPC_UA_NAMESPACE)
-        root = await ua_server.nodes.objects.add_object(idx, "MultiServer_OPC_Bridge")
+        root_idx = await ua_server.register_namespace(OPC_UA_NAMESPACE)
+        root = await ua_server.nodes.objects.add_object(root_idx, "MultiServer_OPC_Bridge")
         tag_routing_map = {}
 
-        for srv, tags in self.config.items():
+        for srv, folders in self.config.items():
             write_queues[srv] = Queue()
             clean = srv.replace(".", "_").replace(" ", "_")
-            folder = await root.add_object(idx, f"Server_{clean}")
-            status_node = await folder.add_variable(idx, "IsConnected", 0.0)
+            srv_node = await root.add_object(root_idx, f"Server_{clean}")
+            status_node = await srv_node.add_variable(root_idx, "IsConnected", 0.0)
 
+            all_tags = []
             ua_vars = {}
-            for tag in tags:
-                ct = tag.replace(".", "_").replace(" ", "_")
-                node = await folder.add_variable(idx, ct, 0.0)
-                await node.set_writable()
-                ua_vars[tag] = node
-                tag_routing_map[node.nodeid] = (srv, tag)
+            for folder, tags in folders.items():
+                if not tags:
+                    continue
+                # Each folder maps to a UA namespace
+                ns_uri = f"{OPC_UA_NAMESPACE}#{folder}"
+                ns_idx = await ua_server.register_namespace(ns_uri)
+                clean_folder = folder.replace(".", "_").replace(" ", "_")
+                folder_node = await srv_node.add_object(ns_idx, f"Folder_{clean_folder}")
+
+                for tag in tags:
+                    ct = tag.replace(".", "_").replace(" ", "_")
+                    node = await folder_node.add_variable(ns_idx, ct, 0.0)
+                    await node.set_writable()
+                    ua_vars[tag] = node
+                    tag_routing_map[node.nodeid] = (srv, tag)
+                    all_tags.append(tag)
 
             t = threading.Thread(
                 target=opc_da_worker,
-                args=(srv, tags, ua_vars, status_node),
+                args=(srv, all_tags, ua_vars, status_node),
                 name=f"Worker_{clean}",
                 daemon=True,
             )
@@ -169,19 +181,21 @@ def load_csv(path):
     with open(path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             srv = row.get("server_name", "").strip()
+            folder = row.get("folder", DEFAULT_FOLDER).strip() or DEFAULT_FOLDER
             tag = row.get("da_tag", "").strip()
             if srv and tag:
-                cfg.setdefault(srv, []).append(tag)
+                cfg.setdefault(srv, {}).setdefault(folder, []).append(tag)
     return cfg
 
 
 def save_csv(path, cfg):
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["server_name", "da_tag"])
+        w = csv.DictWriter(f, fieldnames=["server_name", "folder", "da_tag"])
         w.writeheader()
-        for srv, tags in cfg.items():
-            for tag in tags:
-                w.writerow({"server_name": srv, "da_tag": tag})
+        for srv, folders in cfg.items():
+            for folder, tags in folders.items():
+                for tag in tags:
+                    w.writerow({"server_name": srv, "folder": folder, "da_tag": tag})
 
 
 def opc_da_worker(server_name, tags, ua_variables, ua_status_node):
@@ -302,18 +316,22 @@ class AddServerDialog(QDialog):
 class AddTagDialog(QDialog):
     """Dialog to add a single tag to a server."""
 
-    def __init__(self, server_name, existing_tags, parent=None):
+    def __init__(self, server_name, existing_tags, existing_folders, parent=None):
         super().__init__(parent)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self.setWindowTitle(f"Add Tag → {server_name}")
-        self.resize(400, 120)
+        self.resize(400, 160)
         layout = QFormLayout(self)
         self.tag_edit = QLineEdit()
         self.tag_edit.setPlaceholderText("e.g.  Random.Real4")
         layout.addRow("DA Tag:", self.tag_edit)
 
-        if existing_tags:
-            hint = QLabel("Existing tags: " + ", ".join(existing_tags[:10]))
+        self.folder_edit = QLineEdit()
+        self.folder_edit.setPlaceholderText("e.g.  ProcessData, Alarms, Commands")
+        layout.addRow("Folder:", self.folder_edit)
+
+        if existing_folders:
+            hint = QLabel("Existing folders: " + ", ".join(sorted(existing_folders)))
             hint.setStyleSheet("color: gray; font-size: small;")
             layout.addRow(hint)
 
@@ -328,7 +346,7 @@ class AddTagDialog(QDialog):
         layout.addRow(btns)
 
     def result(self):
-        return self.tag_edit.text().strip()
+        return self.tag_edit.text().strip(), self.folder_edit.text().strip() or DEFAULT_FOLDER
 
 
 class EditTagDialog(QDialog):
@@ -367,7 +385,7 @@ class EditTagDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.config = {}          # { server: [tag, ...] }
+        self.config = {}          # { server: { folder: [tag, ...] } }
         self.engine = None
         self._csv_path = DEFAULT_CSV
 
@@ -521,10 +539,16 @@ class MainWindow(QMainWindow):
             srv_item.setFont(0, QFont("Segoe UI", 9, QFont.Bold))
             srv_item.setForeground(0, QColor("#1565c0"))
 
-            tags = self.config[srv]
-            for tag in tags:
-                tag_item = QTreeWidgetItem(srv_item, [tag, "Tag", ""])
-                tag_item.setForeground(0, QColor("#333"))
+            folders = self.config[srv]
+            for folder in sorted(folders):
+                folder_item = QTreeWidgetItem(srv_item, [folder, "Folder (UA Namespace)", ""])
+                folder_item.setFont(0, QFont("Segoe UI", 9))
+                folder_item.setForeground(0, QColor("#0d47a1"))
+
+                tags = folders[folder]
+                for tag in tags:
+                    tag_item = QTreeWidgetItem(folder_item, [tag, "Tag", ""])
+                    tag_item.setForeground(0, QColor("#333"))
 
         self.tree.expandAll()
         self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
@@ -577,14 +601,14 @@ class MainWindow(QMainWindow):
         if name in self.config:
             QMessageBox.warning(self, "Duplicate", f"Server '{name}' already exists.")
             return
-        self.config[name] = []
+        self.config[name] = {DEFAULT_FOLDER: []}
         self._refresh_tree()
         self._log(f"Added server: {name}")
 
     def _add_tag(self):
         item = self.tree.currentItem()
         if not item:
-            QMessageBox.information(self, "Select Server", "Select a server in the tree first.")
+            QMessageBox.information(self, "Select Server", "Select a server or folder in the tree first.")
             return
         # Walk up to find server item (level 0)
         srv_item = item
@@ -593,27 +617,44 @@ class MainWindow(QMainWindow):
         if not srv_item:
             return
         srv_name = srv_item.text(0)
-        existing = list(self.config.get(srv_name, []))
-        dlg = AddTagDialog(srv_name, existing, self)
+
+        # Determine folder from selection
+        folder = DEFAULT_FOLDER
+        if item != srv_item:
+            # Check if selected item is a folder (level 1)
+            if item.parent() == srv_item:
+                folder = item.text(0)
+            else:
+                # Selected a tag, use its parent folder
+                folder = item.parent().text(0)
+
+        existing_folders = list(self.config.get(srv_name, {}).keys())
+        dlg = AddTagDialog(srv_name, [], existing_folders, self)
+        dlg.folder_edit.setText(folder)
         if dlg.exec_() != QDialog.Accepted:
             return
-        tag = dlg.result()
+        tag, folder = dlg.result()
         if not tag:
             return
-        if tag in existing:
-            QMessageBox.warning(self, "Duplicate", f"Tag '{tag}' already exists on '{srv_name}'.")
+        if tag in self.config.get(srv_name, {}).get(folder, []):
+            QMessageBox.warning(self, "Duplicate", f"Tag '{tag}' already exists in folder '{folder}'.")
             return
-        self.config.setdefault(srv_name, []).append(tag)
+        self.config.setdefault(srv_name, {}).setdefault(folder, []).append(tag)
         self._refresh_tree()
-        self._log(f"Added tag '{tag}' to server '{srv_name}'")
+        self._log(f"Added tag '{tag}' to folder '{folder}' on server '{srv_name}'")
 
     def _edit_tag(self):
         item = self.tree.currentItem()
         if not item or item.parent() is None:
             QMessageBox.information(self, "Select Tag", "Select a tag in the tree to edit.")
             return
-        srv_item = item.parent()
+        # Find server and folder
+        folder_item = item.parent()
+        srv_item = folder_item.parent()
+        if not srv_item:
+            return
         srv_name = srv_item.text(0)
+        folder = folder_item.text(0)
         old_tag = item.text(0)
         dlg = EditTagDialog(srv_name, old_tag, self)
         if dlg.exec_() != QDialog.Accepted:
@@ -621,13 +662,13 @@ class MainWindow(QMainWindow):
         new_tag = dlg.result()
         if not new_tag or new_tag == old_tag:
             return
-        tags = self.config.get(srv_name, [])
+        tags = self.config.get(srv_name, {}).get(folder, [])
         if new_tag in tags:
             QMessageBox.warning(self, "Duplicate", f"Tag '{new_tag}' already exists.")
             return
         tags[tags.index(old_tag)] = new_tag
         self._refresh_tree()
-        self._log(f"Renamed tag '{old_tag}' → '{new_tag}' on '{srv_name}'")
+        self._log(f"Renamed tag '{old_tag}' → '{new_tag}' in folder '{folder}' on '{srv_name}'")
 
     def _delete_selected(self):
         item = self.tree.currentItem()
@@ -647,14 +688,35 @@ class MainWindow(QMainWindow):
                 return
             del self.config[name]
             self._log(f"Deleted server: {name}")
-        elif item.parent():
+        elif item.parent() and item.parent().parent():
             # Deleting a tag
-            srv_name = item.parent().text(0)
+            folder_item = item.parent()
+            srv_item = folder_item.parent()
+            srv_name = srv_item.text(0)
+            folder = folder_item.text(0)
             tag = item.text(0)
-            self.config[srv_name].remove(tag)
+            self.config[srv_name][folder].remove(tag)
+            if not self.config[srv_name][folder]:
+                del self.config[srv_name][folder]
             if not self.config[srv_name]:
                 del self.config[srv_name]
-            self._log(f"Deleted tag '{tag}' from '{srv_name}'")
+            self._log(f"Deleted tag '{tag}' from folder '{folder}' on '{srv_name}'")
+        elif item.parent():
+            # Deleting a folder
+            srv_item = item.parent()
+            srv_name = srv_item.text(0)
+            folder = item.text(0)
+            reply = QMessageBox.question(
+                self, "Delete Folder",
+                f"Delete folder '{folder}' and all its tags from '{srv_name}'?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            del self.config[srv_name][folder]
+            if not self.config[srv_name]:
+                del self.config[srv_name]
+            self._log(f"Deleted folder '{folder}' from '{srv_name}'")
         self._refresh_tree()
 
     def _on_tree_double_click(self, item, column):
