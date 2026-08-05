@@ -241,6 +241,10 @@ class GatewayEngine(QThread):
         ua_vars = {}  # Collect all UA variables across all servers
 
         for srv, folders in self.config.items():
+            # Skip internal configuration keys (e.g., __ssl_enabled__)
+            if not isinstance(folders, dict):
+                continue
+
             write_queues[srv] = Queue()
             clean = srv.replace(".", "_").replace(" ", "_")
             srv_node = await root.add_object(root_idx, f"Server_{clean}")
@@ -289,7 +293,9 @@ class GatewayEngine(QThread):
         self._write_monitor_task = asyncio.create_task(
             _ua_write_monitor(ua_server, ua_vars, handler, self._stop_event)
         )
-        self.log_signal.emit("OPC UA Gateway engine is online.")
+        msg = "OPC UA Gateway is up and running on " + OPC_UA_ENDPOINT
+        logger.info(msg)
+        self.log_signal.emit(msg)
         self._ua_server = ua_server
 
         async with ua_server:
