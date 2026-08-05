@@ -34,6 +34,7 @@ if getattr(sys, 'frozen', False):
 
 import asyncio
 import csv
+import ipaddress
 import json
 import logging
 import signal
@@ -52,7 +53,7 @@ from PySide2.QtWidgets import (
     QFileDialog, QMessageBox, QDialog, QFormLayout, QLineEdit,
     QGroupBox, QSplitter, QTextEdit, QToolBar, QStatusBar,
     QMenuBar, QMenu, QComboBox, QAbstractItemView, QInputDialog,
-    QAction, QRadioButton,
+    QAction, QRadioButton, QCheckBox,
 )
 from PySide2.QtCore import Qt, Slot, QThread, QTimer, Signal
 from PySide2.QtGui import QFont, QColor
@@ -131,10 +132,11 @@ KEY_FILE = "server_key.pem"
 PREFERENCES_FILE = "gateway_prefs.json"
 DEFAULT_LOG_FILE = "gateway.log"
 DEFAULT_LOG_LEVEL = "INFO"
+DEFAULT_SSL_ENABLED = False
 
 
 def load_preferences():
-    prefs = {"log_level": DEFAULT_LOG_LEVEL, "log_file": DEFAULT_LOG_FILE}
+    prefs = {"log_level": DEFAULT_LOG_LEVEL, "log_file": DEFAULT_LOG_FILE, "ssl_enabled": DEFAULT_SSL_ENABLED}
     if os.path.exists(PREFERENCES_FILE):
         try:
             with open(PREFERENCES_FILE, "r", encoding="utf-8") as f:
@@ -220,15 +222,19 @@ class GatewayEngine(QThread):
             return
 
         # Generate and load self-signed certificate
+        ssl_enabled = self.config.get("__ssl_enabled__", False)
         _ensure_self_signed_cert()
         ua_server = Server()
         await ua_server.init()
         ua_server.set_endpoint(OPC_UA_ENDPOINT)
-        try:
-            await ua_server.load_certificate(CERT_FILE)
-            await ua_server.load_private_key(KEY_FILE)
-        except Exception as e:
-            logger.warning(f"Could not load certificate: {e}")
+        if ssl_enabled:
+            try:
+                await ua_server.load_certificate(CERT_FILE)
+                await ua_server.load_private_key(KEY_FILE)
+                logger.info("SSL/TLS enabled with self-signed certificate")
+            except Exception as e:
+                logger.warning(f"Could not load certificate: {e}")
+                logger.warning("Falling back to open (unencrypted) endpoint")
         root_idx = await ua_server.register_namespace(OPC_UA_NAMESPACE)
         root = await ua_server.nodes.objects.add_object(root_idx, "MultiServer_OPC_Bridge")
         tag_routing_map = {}
@@ -396,9 +402,9 @@ def _da_type_to_ua(val):
     return ua.VariantType.Double, 0.0
 
 
-def _ensure_self_signed_cert():
+def _ensure_self_signed_cert(force=False):
     """Generate a self-signed certificate if it doesn't already exist."""
-    if os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE):
+    if not force and os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE):
         return
     try:
         from cryptography import x509
@@ -424,6 +430,15 @@ def _ensure_self_signed_cert():
             .serial_number(x509.random_serial_number())
             .not_valid_before(datetime.utcnow())
             .not_valid_after(datetime.utcnow() + timedelta(days=365))
+            .add_extension(
+                x509.SubjectAlternativeName([
+                    x509.DNSName(u"localhost"),
+                    x509.DNSName(u"*"),
+                    x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+                    x509.IPAddress(ipaddress.IPv4Address("0.0.0.0")),
+                ]),
+                critical=False,
+            )
             .sign(key, hashes.SHA256(), default_backend())
         )
         with open(CERT_FILE, "wb") as f:
@@ -657,7 +672,7 @@ class PreferencesDialog(QDialog):
         super().__init__(parent)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self.setWindowTitle("Preferences")
-        self.resize(400, 250)
+        self.resize(450, 380)
 
         self.prefs = load_preferences()
 
@@ -698,6 +713,34 @@ class PreferencesDialog(QDialog):
 
         layout.addWidget(log_file_group)
 
+        # SSL/TLS Group
+        ssl_group = QGroupBox("SSL/TLS")
+        ssl_layout = QVBoxLayout(ssl_group)
+
+        self.chk_ssl = QCheckBox("Enable SSL/TLS encryption (requires restart)")
+        self.chk_ssl.setChecked(self.prefs.get("ssl_enabled", DEFAULT_SSL_ENABLED))
+        ssl_layout.addWidget(self.chk_ssl)
+
+        ssl_hint = QLabel(
+            "When enabled, the OPC UA server uses a self-signed certificate."
+        )
+        ssl_hint.setStyleSheet("color: gray; font-size: small;")
+        ssl_layout.addWidget(ssl_hint)
+
+        # Certificate info and regeneration
+        cert_info_layout = QHBoxLayout()
+        cert_path_label = QLabel(f"Certificate: {os.path.abspath(CERT_FILE)}")
+        cert_path_label.setStyleSheet("font-size: small; color: #555;")
+        cert_path_label.setWordWrap(True)
+        cert_info_layout.addWidget(cert_path_label)
+
+        self.btn_regenerate_cert = QPushButton("Regenerate Certificate")
+        self.btn_regenerate_cert.clicked.connect(self._regenerate_certificate)
+        cert_info_layout.addWidget(self.btn_regenerate_cert)
+
+        ssl_layout.addLayout(cert_info_layout)
+        layout.addWidget(ssl_group)
+
         # Description
         desc = QLabel(
             "Log output is written to both the Gateway Log pane and the log file."
@@ -727,6 +770,27 @@ class PreferencesDialog(QDialog):
         if path:
             self.log_file_edit.setText(path)
 
+    def _regenerate_certificate(self):
+        """Regenerate the self-signed certificate."""
+        reply = QMessageBox.question(
+            self, "Regenerate Certificate",
+            "This will regenerate the self-signed certificate. "
+            "Connected clients will need to re-trust the new certificate.\n\n"
+            "Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            _ensure_self_signed_cert(force=True)
+            QMessageBox.information(
+                self, "Certificate Regenerated",
+                f"New certificate generated:\n{os.path.abspath(CERT_FILE)}",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to generate certificate: {e}")
+
     def get_prefs(self):
         if self.radio_info.isChecked():
             level = "INFO"
@@ -736,8 +800,9 @@ class PreferencesDialog(QDialog):
             level = "ERROR"
 
         log_file = self.log_file_edit.text().strip() or DEFAULT_LOG_FILE
+        ssl_enabled = self.chk_ssl.isChecked()
 
-        return {"log_level": level, "log_file": log_file}
+        return {"log_level": level, "log_file": log_file, "ssl_enabled": ssl_enabled}
 
 
 # ===================================================================
@@ -1121,6 +1186,7 @@ class MainWindow(QMainWindow):
         if self.engine and self.engine.isRunning():
             return
         self.engine = GatewayEngine(dict(self.config))
+        self.engine.config["__ssl_enabled__"] = self.prefs.get("ssl_enabled", DEFAULT_SSL_ENABLED)
         self.engine.log_signal.connect(self._log)
         self.engine.start()
         self.btn_start.setEnabled(False)
