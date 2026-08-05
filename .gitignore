@@ -5,7 +5,7 @@ dist*
 venv*
 .ven/
 *.egg-info/
-gatewayl.log
+gateway.log
 gateway_prefs.json
 tags.csv
 
