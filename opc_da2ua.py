@@ -37,6 +37,7 @@ import csv
 import logging
 import threading
 import time
+from datetime import datetime
 from queue import Queue
 
 import OpenOPC
@@ -119,6 +120,15 @@ class GatewayEngine(QThread):
 
             all_tags = []
             ua_vars = {}
+
+            # Collect all tags first so we can probe types
+            for folder, tags in folders.items():
+                if tags:
+                    all_tags.extend(tags)
+
+            # Probe DA types before creating UA variables
+            tag_types = _probe_da_types(srv, all_tags)
+
             for folder, tags in folders.items():
                 if not tags:
                     continue
@@ -130,11 +140,11 @@ class GatewayEngine(QThread):
 
                 for tag in tags:
                     ct = tag.replace(".", "_").replace(" ", "_")
-                    node = await folder_node.add_variable(ns_idx, ct, 0.0)
+                    vtype, default_val = tag_types.get(tag, (ua.VariantType.Double, 0.0))
+                    node = await folder_node.add_variable(ns_idx, ct, default_val, vtype)
                     await node.set_writable()
                     ua_vars[tag] = node
                     tag_routing_map[node.nodeid] = (srv, tag)
-                    all_tags.append(tag)
 
             t = threading.Thread(
                 target=opc_da_worker,
@@ -196,6 +206,51 @@ def save_csv(path, cfg):
             for folder, tags in folders.items():
                 for tag in tags:
                     w.writerow({"server_name": srv, "folder": folder, "da_tag": tag})
+
+
+def _da_type_to_ua(val):
+    """Return (VariantType, default_value) for a Python value read from OPC DA."""
+    if isinstance(val, bool):
+        return ua.VariantType.Boolean, False
+    if isinstance(val, int):
+        return ua.VariantType.Int64, 0
+    if isinstance(val, float):
+        return ua.VariantType.Double, 0.0
+    if isinstance(val, str):
+        return ua.VariantType.String, ""
+    if isinstance(val, datetime):
+        return ua.VariantType.DateTime, datetime.min
+    return ua.VariantType.Double, 0.0
+
+
+def _probe_da_types(server_name, tags):
+    """Connect to an OPC DA server, read every tag once, and return { tag: (VariantType, default_value) }."""
+    types = {}
+    client = None
+    try:
+        client = OpenOPC.client()
+        client.connect(server_name)
+        # Read in chunks (same size used by the worker)
+        for i in range(0, len(tags), CHUNK_SIZE):
+            chunk = tags[i:i + CHUNK_SIZE]
+            for tname, val, qual, ts in client.read(chunk):
+                if qual == "Good":
+                    types[tname] = _da_type_to_ua(val)
+                else:
+                    types[tname] = (ua.VariantType.Double, 0.0)  # fallback
+    except Exception as e:
+        logger.warning(f"Type probe [{server_name}] failed: {e} – falling back to Double")
+    finally:
+        if client:
+            try:
+                client.close()
+            except Exception:
+                pass
+    # Fill in any tags that were missed
+    for tag in tags:
+        if tag not in types:
+            types[tag] = (ua.VariantType.Double, 0.0)
+    return types
 
 
 def opc_da_worker(server_name, tags, ua_variables, ua_status_node):
