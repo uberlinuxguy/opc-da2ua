@@ -46,7 +46,7 @@ if (-not $python38_exe) {
     Write-Host "ERROR: 32-bit Python 3.8 not found on this system." -ForegroundColor Red
     Write-Host ""
     Write-Host "Please install 32-bit Python 3.8 from:" -ForegroundColor Yellow
-    Write-Host "  https://www.python.org/ftp/python/3.8.19/python-3.8.19.exe" -ForegroundColor Cyan
+    Write-Host "  https://www.python.org/ftp/python/3.8.10/python-3.8.10.exe" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "IMPORTANT: Select 'Install for all users' and check" -ForegroundColor Yellow
     Write-Host "'Add Python 3.8 to PATH' during installation." -ForegroundColor Yellow
