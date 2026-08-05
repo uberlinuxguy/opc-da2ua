@@ -653,12 +653,15 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_toolbar()
 
-        # Wire Qt log handler to log_view
-        qthandler.set_signal(self._log_signal)
+        # Connect the log signal to the log view
+        self._log_signal.connect(self._log)
 
-        # Apply saved preferences
+        # Apply saved preferences (this creates the qthandler)
         self.prefs = load_preferences()
         apply_preferences(self.prefs)
+
+        # Wire Qt log handler to log_view (after apply_preferences creates qthandler)
+        qthandler.set_signal(self._log_signal)
 
         self._load_default_csv()
 
@@ -1039,6 +1042,8 @@ class MainWindow(QMainWindow):
         save_preferences(new_prefs)
         self.prefs = new_prefs
         apply_preferences(new_prefs)
+        # Re-wire the Qt log handler signal (apply_preferences creates a new handler)
+        qthandler.set_signal(self._log_signal)
         self._log("Preferences saved.")
         self.statusBar().showMessage("Preferences saved")
 
