@@ -210,6 +210,7 @@ class GatewayEngine(QThread):
 
     # -- QThread.run --------------------------------------------------------
     def run(self):
+        threading.current_thread().name = self.objectName() or "OPC-UA-Server"
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         global async_loop
