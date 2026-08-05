@@ -34,6 +34,7 @@ if getattr(sys, 'frozen', False):
 
 import asyncio
 import csv
+import json
 import logging
 import threading
 import time
@@ -49,18 +50,60 @@ from PySide2.QtWidgets import (
     QFileDialog, QMessageBox, QDialog, QFormLayout, QLineEdit,
     QGroupBox, QSplitter, QTextEdit, QToolBar, QStatusBar,
     QMenuBar, QMenu, QComboBox, QAbstractItemView, QInputDialog,
-    QAction,
+    QAction, QRadioButton,
 )
 from PySide2.QtCore import Qt, Slot, QThread, QTimer, Signal
 from PySide2.QtGui import QFont, QColor
 
 # ---------------------------------------------------------------------------
-# Logging
+# Custom logging – routes to file + Qt log pane
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s'
-)
+
+class QtLogHandler(logging.Handler):
+    """Emits log records to a Qt signal for display in the log pane."""
+
+    _signal = None
+
+    def set_signal(self, signal):
+        self._signal = signal
+
+    def emit(self, record):
+        if self._signal:
+            msg = self.format(record)
+            try:
+                self._signal.emit(msg)
+            except RuntimeError:
+                pass  # Signal may be disconnected during shutdown
+
+
+def setup_logging(level=logging.INFO, log_file="gateway.log"):
+    """Configure root logger with file + Qt handlers."""
+    fmt = logging.Formatter(
+        '%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+
+    # File handler
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setFormatter(fmt)
+
+    # Qt handler (signal wired later by MainWindow)
+    qth = QtLogHandler()
+    qth.setFormatter(fmt)
+
+    # Root logger
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)  # Let handlers filter
+    # Remove any existing basicConfig handlers
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+    root.addHandler(fh)
+    root.addHandler(qth)
+
+    return qth
+
+
+qthandler = setup_logging()
 logger = logging.getLogger("OPC_MultiServer_Gateway")
 
 # ---------------------------------------------------------------------------
@@ -76,6 +119,72 @@ DEFAULT_FOLDER = "Default"
 
 write_queues = {}
 async_loop = None
+
+
+# ---------------------------------------------------------------------------
+# Preferences
+# ---------------------------------------------------------------------------
+PREFERENCES_FILE = "gateway_prefs.json"
+DEFAULT_LOG_FILE = "gateway.log"
+DEFAULT_LOG_LEVEL = "INFO"
+
+
+def load_preferences():
+    prefs = {"log_level": DEFAULT_LOG_LEVEL, "log_file": DEFAULT_LOG_FILE}
+    if os.path.exists(PREFERENCES_FILE):
+        try:
+            with open(PREFERENCES_FILE, "r", encoding="utf-8") as f:
+                user = json.load(f)
+            if isinstance(user, dict):
+                prefs.update(user)
+        except Exception:
+            pass
+    return prefs
+
+
+def save_preferences(prefs):
+    with open(PREFERENCES_FILE, "w", encoding="utf-8") as f:
+        json.dump(prefs, f, indent=2)
+
+
+def apply_preferences(prefs=None):
+    """Apply preferences to logging configuration."""
+    if prefs is None:
+        prefs = load_preferences()
+
+    level_str = prefs.get("log_level", DEFAULT_LOG_LEVEL).upper()
+    level_map = {"INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR}
+    level = level_map.get(level_str, logging.INFO)
+
+    log_file = prefs.get("log_file", DEFAULT_LOG_FILE)
+
+    # Reconfigure logging
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    # Remove old handlers
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+
+    fmt = logging.Formatter(
+        '%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+
+    # File handler
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setFormatter(fmt)
+    fh.setLevel(level)
+    root.addHandler(fh)
+
+    # Qt handler (will be wired by MainWindow)
+    global qthandler
+    qthandler = QtLogHandler()
+    qthandler.setFormatter(fmt)
+    qthandler.setLevel(level)
+    root.addHandler(qthandler)
+
+    logger.info(f"Logging configured: level={level_str}, file={log_file}")
 
 
 # ===================================================================
@@ -430,6 +539,99 @@ class EditTagDialog(QDialog):
 
 
 # ===================================================================
+# Preferences dialog
+# ===================================================================
+class PreferencesDialog(QDialog):
+    """Dialog to configure gateway preferences."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setWindowTitle("Preferences")
+        self.resize(400, 250)
+
+        self.prefs = load_preferences()
+
+        layout = QVBoxLayout(self)
+
+        # Log Level Group
+        log_level_group = QGroupBox("Log Level")
+        log_level_layout = QVBoxLayout(log_level_group)
+
+        self.radio_info = QRadioButton("Info")
+        self.radio_warning = QRadioButton("Warning")
+        self.radio_error = QRadioButton("Error")
+
+        current_level = self.prefs.get("log_level", DEFAULT_LOG_LEVEL).upper()
+        if current_level == "INFO":
+            self.radio_info.setChecked(True)
+        elif current_level == "WARNING":
+            self.radio_warning.setChecked(True)
+        else:
+            self.radio_error.setChecked(True)
+
+        log_level_layout.addWidget(self.radio_info)
+        log_level_layout.addWidget(self.radio_warning)
+        log_level_layout.addWidget(self.radio_error)
+        layout.addWidget(log_level_group)
+
+        # Log File Group
+        log_file_group = QGroupBox("Log File")
+        log_file_layout = QHBoxLayout(log_file_group)
+
+        self.log_file_edit = QLineEdit(self.prefs.get("log_file", DEFAULT_LOG_FILE))
+        self.log_file_edit.setPlaceholderText("gateway.log")
+        log_file_layout.addWidget(self.log_file_edit)
+
+        self.btn_browse = QPushButton("Browse...")
+        self.btn_browse.clicked.connect(self._browse_log_file)
+        log_file_layout.addWidget(self.btn_browse)
+
+        layout.addWidget(log_file_group)
+
+        # Description
+        desc = QLabel(
+            "Log output is written to both the Gateway Log pane and the log file."
+        )
+        desc.setStyleSheet("color: gray; font-size: small; margin-top: 4px;")
+        layout.addWidget(desc)
+
+        layout.addStretch()
+
+        # Buttons
+        btns = QHBoxLayout()
+        ok = QPushButton("Save")
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        btns.addStretch()
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        layout.addLayout(btns)
+
+    def _browse_log_file(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Select Log File",
+            self.log_file_edit.text() or DEFAULT_LOG_FILE,
+            "Log Files (*.log);;All Files (*)"
+        )
+        if path:
+            self.log_file_edit.setText(path)
+
+    def get_prefs(self):
+        if self.radio_info.isChecked():
+            level = "INFO"
+        elif self.radio_warning.isChecked():
+            level = "WARNING"
+        else:
+            level = "ERROR"
+
+        log_file = self.log_file_edit.text().strip() or DEFAULT_LOG_FILE
+
+        return {"log_level": level, "log_file": log_file}
+
+
+# ===================================================================
 # Main window
 # ===================================================================
 
@@ -438,15 +640,26 @@ class EditTagDialog(QDialog):
 # Main window
 # ===================================================================
 class MainWindow(QMainWindow):
+    _log_signal = Signal(str)
+
     def __init__(self):
         super().__init__()
         self.config = {}          # { server: { folder: [tag, ...] } }
         self.engine = None
         self._csv_path = DEFAULT_CSV
+        self.prefs = {}
 
         self._build_ui()
         self._build_menu()
         self._build_toolbar()
+
+        # Wire Qt log handler to log_view
+        qthandler.set_signal(self._log_signal)
+
+        # Apply saved preferences
+        self.prefs = load_preferences()
+        apply_preferences(self.prefs)
+
         self._load_default_csv()
 
         self.statusBar().showMessage("Ready")
@@ -565,6 +778,12 @@ class MainWindow(QMainWindow):
         act_del.setShortcut("Del")
         act_del.triggered.connect(self._delete_selected)
         edit_menu.addAction(act_del)
+
+        edit_menu.addSeparator()
+        act_prefs = QAction("Preferences…", self)
+        act_prefs.setShortcut("Ctrl+,")
+        act_prefs.triggered.connect(self._open_preferences)
+        edit_menu.addAction(act_prefs)
 
         # Help
         help_menu = menubar.addMenu("&Help")
@@ -811,6 +1030,17 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _log(self, msg):
         self.log_view.append(msg)
+
+    def _open_preferences(self):
+        dlg = PreferencesDialog(self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        new_prefs = dlg.get_prefs()
+        save_preferences(new_prefs)
+        self.prefs = new_prefs
+        apply_preferences(new_prefs)
+        self._log("Preferences saved.")
+        self.statusBar().showMessage("Preferences saved")
 
     def _about(self):
         QMessageBox.about(
