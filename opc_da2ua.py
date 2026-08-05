@@ -1193,6 +1193,7 @@ class MainWindow(QMainWindow):
         if self.engine and self.engine.isRunning():
             return
         self.engine = GatewayEngine(dict(self.config))
+        self.engine.setObjectName("OPCUA-1")
         self.engine.config["__ssl_enabled__"] = self.prefs.get("ssl_enabled", DEFAULT_SSL_ENABLED)
         self.engine.log_signal.connect(self._log)
         self.engine.start()
