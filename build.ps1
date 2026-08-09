@@ -24,7 +24,7 @@ $NUITKA_VERSION = "1.8.0"  # Last version with good Python 3.8 support
 # ------------------------------------------------------------------
 # Step 1: Install Python 3.8-32 if not present
 # ------------------------------------------------------------------
-Write-Host "[1/5] Checking for 32-bit Python 3.8..." -ForegroundColor Yellow
+Write-Host "[1/4] Checking for 32-bit Python 3.8..." -ForegroundColor Yellow
 
 # Only look for 32-bit Python 3.8 (required for OPC DA COM compatibility)
 $python38_paths = @(
@@ -60,7 +60,7 @@ Write-Host "  Found: $python38_exe" -ForegroundColor Green
 # Step 2: Create virtual environment
 # ------------------------------------------------------------------
 Write-Host ""
-Write-Host "[2/5] Setting up virtual environment..." -ForegroundColor Yellow
+Write-Host "[2/4] Setting up virtual environment..." -ForegroundColor Yellow
 
 if ($Clean) {
     Write-Host "  Removing existing venv..." -ForegroundColor Gray
@@ -72,6 +72,12 @@ if ($Clean) {
             Remove-Item -Recurse -Force $dir
         }
     }
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host "  Clean complete!" -ForegroundColor Green
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host ""
+    exit 0
 }
 
 if (Test-Path $VENV_DIR) {
@@ -85,7 +91,7 @@ if (Test-Path $VENV_DIR) {
 # Step 3: Install dependencies
 # ------------------------------------------------------------------
 Write-Host ""
-Write-Host "[3/5] Installing dependencies (this may take a few minutes)..." -ForegroundColor Yellow
+Write-Host "[3/4] Installing dependencies (this may take a few minutes)..." -ForegroundColor Yellow
 
 # Upgrade pip first
 & $PYTHON_EXE -m pip install --upgrade pip setuptools wheel --quiet
@@ -116,29 +122,10 @@ if ($VenvOnly) {
 }
 
 # ------------------------------------------------------------------
-# Step 4: Clean previous build (only if "clean" is passed)
-# ------------------------------------------------------------------
-if ($Clean) {
-    Write-Host ""
-    Write-Host "[4/5] Cleaning previous build artifacts..." -ForegroundColor Yellow
-
-    $clean_dirs = @("dist", "build", "opc_da2ua.build", "opc_da2ua.dist")
-    foreach ($dir in $clean_dirs) {
-        if (Test-Path $dir) {
-            Remove-Item -Recurse -Force $dir
-            Write-Host "  Removed: $dir" -ForegroundColor Gray
-        }
-    }
-} else {
-    Write-Host ""
-    Write-Host "[4/5] Skipping cleanup (pass 'clean' to remove old artifacts)" -ForegroundColor Gray
-}
-
-# ------------------------------------------------------------------
-# Step 5: Build with Nuitka
+# Step 4: Build with Nuitka
 # ------------------------------------------------------------------
 Write-Host ""
-Write-Host "[5/5] Building with Nuitka..." -ForegroundColor Yellow
+Write-Host "[4/4] Building with Nuitka..." -ForegroundColor Yellow
 Write-Host ""
 
 & $PYTHON_EXE -m nuitka `
