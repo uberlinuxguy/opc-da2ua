@@ -845,43 +845,6 @@ class PreferencesDialog(QDialog):
 
         layout.addWidget(da_group)
 
-        # DA Data Retrieval Group
-        da_group = QGroupBox("OPC DA Data Retrieval")
-        da_layout = QFormLayout(da_group)
-
-        # DA Mode (polling vs subscription)
-        self.da_mode_combo = QComboBox()
-        self.da_mode_combo.addItems(["Polling", "Subscription"])
-        current_mode = self.prefs.get("da_mode", DEFAULT_DA_MODE).lower()
-        if current_mode == "subscription":
-            self.da_mode_combo.setCurrentIndex(1)
-        da_layout.addRow("Mode:", self.da_mode_combo)
-
-        da_mode_hint = QLabel(
-            "Polling reads all tags periodically.\n"
-            "Subscription receives change notifications from the DA server."
-        )
-        da_mode_hint.setStyleSheet("color: gray; font-size: small;")
-        da_layout.addRow(da_mode_hint)
-
-        # Polling interval
-        self.poll_interval_edit = QLineEdit(
-            str(self.prefs.get("poll_interval", DEFAULT_POLL_INTERVAL))
-        )
-        self.poll_interval_edit.setPlaceholderText("0.5")
-        poll_label = QLabel("Poll interval (seconds):")
-        da_layout.addRow(poll_label, self.poll_interval_edit)
-
-        # Chunk size
-        self.chunk_size_edit = QLineEdit(
-            str(self.prefs.get("chunk_size", DEFAULT_CHUNK_SIZE))
-        )
-        self.chunk_size_edit.setPlaceholderText("500")
-        chunk_label = QLabel("Chunk size (tags per batch):")
-        da_layout.addRow(chunk_label, self.chunk_size_edit)
-
-        layout.addWidget(da_group)
-
         # Description
         desc = QLabel(
             "Log output is written to both the Gateway Log pane and the log file."
