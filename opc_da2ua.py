@@ -115,8 +115,9 @@ logger = logging.getLogger("OPC_MultiServer_Gateway")
 DEFAULT_CSV = "tags.csv"
 OPC_UA_ENDPOINT = "opc.tcp://0.0.0.0:4840/freeopcua/server/"
 OPC_UA_NAMESPACE = "http://mycompany.com"
-CHUNK_SIZE = 500
-POLL_INTERVAL = 0.5
+DEFAULT_CHUNK_SIZE = 500
+DEFAULT_POLL_INTERVAL = 0.5
+DEFAULT_DA_MODE = "polling"  # "polling" or "subscription"
 RECONNECT_DELAY = 5.0
 DEFAULT_FOLDER = "Default"
 
@@ -133,10 +134,20 @@ PREFERENCES_FILE = "gateway_prefs.json"
 DEFAULT_LOG_FILE = "gateway.log"
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_SSL_ENABLED = False
+DEFAULT_CHUNK_SIZE_PREF = DEFAULT_CHUNK_SIZE
+DEFAULT_POLL_INTERVAL_PREF = DEFAULT_POLL_INTERVAL
+DEFAULT_DA_MODE_PREF = DEFAULT_DA_MODE
 
 
 def load_preferences():
-    prefs = {"log_level": DEFAULT_LOG_LEVEL, "log_file": DEFAULT_LOG_FILE, "ssl_enabled": DEFAULT_SSL_ENABLED}
+    prefs = {
+        "log_level": DEFAULT_LOG_LEVEL,
+        "log_file": DEFAULT_LOG_FILE,
+        "ssl_enabled": DEFAULT_SSL_ENABLED,
+        "chunk_size": DEFAULT_CHUNK_SIZE_PREF,
+        "poll_interval": DEFAULT_POLL_INTERVAL_PREF,
+        "da_mode": DEFAULT_DA_MODE_PREF,
+    }
     if os.path.exists(PREFERENCES_FILE):
         try:
             with open(PREFERENCES_FILE, "r", encoding="utf-8") as f:
@@ -282,9 +293,15 @@ class GatewayEngine(QThread):
                     srv_ua_vars[tag] = node
                     tag_routing_map[node.nodeid] = (srv, tag)
 
+            # Pass gateway preferences to the worker
+            chunk_size = self.config.get("__chunk_size__", DEFAULT_CHUNK_SIZE)
+            poll_interval = self.config.get("__poll_interval__", DEFAULT_POLL_INTERVAL)
+            da_mode = self.config.get("__da_mode__", DEFAULT_DA_MODE)
+
             t = threading.Thread(
                 target=opc_da_worker,
-                args=(srv, all_tags, srv_ua_vars, status_node, self.server_status_signal),
+                args=(srv, all_tags, srv_ua_vars, status_node, self.server_status_signal,
+                      chunk_size, poll_interval, da_mode),
                 name=f"Worker_{clean}",
                 daemon=True,
             )
@@ -472,9 +489,9 @@ def _probe_da_types(server_name, tags):
     try:
         client = OpenOPC.client()
         client.connect(server_name)
-        # Read in chunks (same size used by the worker)
-        for i in range(0, len(tags), CHUNK_SIZE):
-            chunk = tags[i:i + CHUNK_SIZE]
+        # Read in chunks (same default size used by the worker)
+        for i in range(0, len(tags), DEFAULT_CHUNK_SIZE):
+            chunk = tags[i:i + DEFAULT_CHUNK_SIZE]
             for tname, val, qual, ts in client.read(chunk):
                 if qual == "Good":
                     types[tname] = _da_type_to_ua(val)
@@ -495,13 +512,16 @@ def _probe_da_types(server_name, tags):
     return types
 
 
-def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status_signal):
+def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status_signal,
+                   chunk_size=DEFAULT_CHUNK_SIZE, poll_interval=DEFAULT_POLL_INTERVAL,
+                   da_mode=DEFAULT_DA_MODE):
     global async_loop
     pythoncom.CoInitialize()
     my_queue = write_queues[server_name]
-    chunks = [tags[i:i + CHUNK_SIZE] for i in range(0, len(tags), CHUNK_SIZE)]
+    chunks = [tags[i:i + chunk_size] for i in range(0, len(tags), chunk_size)]
     da_client = None
     connected = False
+    subscribed = False
 
     while True:
         if not connected:
@@ -528,6 +548,17 @@ def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status
                 except RuntimeError:
                     pass
                 logger.info(f"Connected to [{server_name}]")
+
+                # Subscribe if using subscription mode
+                if da_mode == "subscription":
+                    try:
+                        da_client.subscribe(tags, poll_interval * 1000)
+                        subscribed = True
+                        logger.info(f"[{server_name}] subscribed to {len(tags)} tags (interval={poll_interval}s)")
+                    except Exception as e:
+                        logger.warning(f"[{server_name}] subscription failed ({e}), falling back to polling")
+                        subscribed = False
+
             except Exception as e:
                 logger.error(f"Connect [{server_name}] failed: {e}")
                 time.sleep(RECONNECT_DELAY)
@@ -542,21 +573,33 @@ def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status
                     logger.error(f"[{server_name}] write {tag}: {e}")
                 my_queue.task_done()
 
-            for chunk in chunks:
-                for tname, val, qual, ts in da_client.read(chunk):
+            if da_mode == "subscription" and subscribed:
+                # Subscription mode – read returns only changed values
+                for tname, val, qual, ts in da_client.read(tags):
                     if qual == "Good" and async_loop:
                         asyncio.run_coroutine_threadsafe(
                             ua_variables[tname].write_value(val), async_loop
                         )
-                        # Also write back to DA
-                        try:
-                            da_client.write((tname, val))  # type: ignore[union-attr]
-                        except Exception as e:
-                            logger.error(f"[{server_name}] writeback {tname}: {e}")
-            time.sleep(POLL_INTERVAL)
+                time.sleep(max(poll_interval / 10, 0.05))
+            else:
+                # Polling mode – read all tags in chunks
+                for chunk in chunks:
+                    for tname, val, qual, ts in da_client.read(chunk):
+                        if qual == "Good" and async_loop:
+                            asyncio.run_coroutine_threadsafe(
+                                ua_variables[tname].write_value(val), async_loop
+                            )
+                time.sleep(poll_interval)
         except Exception as e:
             logger.error(f"[{server_name}] broken: {e}")
             connected = False
+            # Unsubscribe if we were subscribed
+            if subscribed:
+                try:
+                    da_client.unsubscribe(tags)
+                except Exception:
+                    pass
+                subscribed = False
             # Emit disconnected status
             try:
                 server_status_signal.emit(server_name, False)
@@ -765,6 +808,80 @@ class PreferencesDialog(QDialog):
         ssl_layout.addLayout(cert_info_layout)
         layout.addWidget(ssl_group)
 
+        # DA Data Retrieval Group
+        da_group = QGroupBox("OPC DA Data Retrieval")
+        da_layout = QFormLayout(da_group)
+
+        # DA Mode (polling vs subscription)
+        self.da_mode_combo = QComboBox()
+        self.da_mode_combo.addItems(["Polling", "Subscription"])
+        current_mode = self.prefs.get("da_mode", DEFAULT_DA_MODE).lower()
+        if current_mode == "subscription":
+            self.da_mode_combo.setCurrentIndex(1)
+        da_layout.addRow("Mode:", self.da_mode_combo)
+
+        da_mode_hint = QLabel(
+            "Polling reads all tags periodically.\n"
+            "Subscription receives change notifications from the DA server."
+        )
+        da_mode_hint.setStyleSheet("color: gray; font-size: small;")
+        da_layout.addRow(da_mode_hint)
+
+        # Polling interval
+        self.poll_interval_edit = QLineEdit(
+            str(self.prefs.get("poll_interval", DEFAULT_POLL_INTERVAL))
+        )
+        self.poll_interval_edit.setPlaceholderText("0.5")
+        poll_label = QLabel("Poll interval (seconds):")
+        da_layout.addRow(poll_label, self.poll_interval_edit)
+
+        # Chunk size
+        self.chunk_size_edit = QLineEdit(
+            str(self.prefs.get("chunk_size", DEFAULT_CHUNK_SIZE))
+        )
+        self.chunk_size_edit.setPlaceholderText("500")
+        chunk_label = QLabel("Chunk size (tags per batch):")
+        da_layout.addRow(chunk_label, self.chunk_size_edit)
+
+        layout.addWidget(da_group)
+
+        # DA Data Retrieval Group
+        da_group = QGroupBox("OPC DA Data Retrieval")
+        da_layout = QFormLayout(da_group)
+
+        # DA Mode (polling vs subscription)
+        self.da_mode_combo = QComboBox()
+        self.da_mode_combo.addItems(["Polling", "Subscription"])
+        current_mode = self.prefs.get("da_mode", DEFAULT_DA_MODE).lower()
+        if current_mode == "subscription":
+            self.da_mode_combo.setCurrentIndex(1)
+        da_layout.addRow("Mode:", self.da_mode_combo)
+
+        da_mode_hint = QLabel(
+            "Polling reads all tags periodically.\n"
+            "Subscription receives change notifications from the DA server."
+        )
+        da_mode_hint.setStyleSheet("color: gray; font-size: small;")
+        da_layout.addRow(da_mode_hint)
+
+        # Polling interval
+        self.poll_interval_edit = QLineEdit(
+            str(self.prefs.get("poll_interval", DEFAULT_POLL_INTERVAL))
+        )
+        self.poll_interval_edit.setPlaceholderText("0.5")
+        poll_label = QLabel("Poll interval (seconds):")
+        da_layout.addRow(poll_label, self.poll_interval_edit)
+
+        # Chunk size
+        self.chunk_size_edit = QLineEdit(
+            str(self.prefs.get("chunk_size", DEFAULT_CHUNK_SIZE))
+        )
+        self.chunk_size_edit.setPlaceholderText("500")
+        chunk_label = QLabel("Chunk size (tags per batch):")
+        da_layout.addRow(chunk_label, self.chunk_size_edit)
+
+        layout.addWidget(da_group)
+
         # Description
         desc = QLabel(
             "Log output is written to both the Gateway Log pane and the log file."
@@ -826,7 +943,33 @@ class PreferencesDialog(QDialog):
         log_file = self.log_file_edit.text().strip() or DEFAULT_LOG_FILE
         ssl_enabled = self.chk_ssl.isChecked()
 
-        return {"log_level": level, "log_file": log_file, "ssl_enabled": ssl_enabled}
+        # DA mode
+        da_mode = "subscription" if self.da_mode_combo.currentIndex() == 1 else "polling"
+
+        # Poll interval
+        try:
+            poll_interval = float(self.poll_interval_edit.text().strip())
+            if poll_interval <= 0:
+                poll_interval = DEFAULT_POLL_INTERVAL
+        except ValueError:
+            poll_interval = DEFAULT_POLL_INTERVAL
+
+        # Chunk size
+        try:
+            chunk_size = int(self.chunk_size_edit.text().strip())
+            if chunk_size <= 0:
+                chunk_size = DEFAULT_CHUNK_SIZE
+        except ValueError:
+            chunk_size = DEFAULT_CHUNK_SIZE
+
+        return {
+            "log_level": level,
+            "log_file": log_file,
+            "ssl_enabled": ssl_enabled,
+            "da_mode": da_mode,
+            "poll_interval": poll_interval,
+            "chunk_size": chunk_size,
+        }
 
 
 # ===================================================================
@@ -1217,6 +1360,9 @@ class MainWindow(QMainWindow):
         self.engine = GatewayEngine(dict(self.config))
         self.engine.setObjectName("OPCUA-1")
         self.engine.config["__ssl_enabled__"] = self.prefs.get("ssl_enabled", DEFAULT_SSL_ENABLED)
+        self.engine.config["__da_mode__"] = self.prefs.get("da_mode", DEFAULT_DA_MODE)
+        self.engine.config["__poll_interval__"] = self.prefs.get("poll_interval", DEFAULT_POLL_INTERVAL)
+        self.engine.config["__chunk_size__"] = self.prefs.get("chunk_size", DEFAULT_CHUNK_SIZE)
         self.engine.log_signal.connect(self._log)
         self.engine.server_status_signal.connect(self._on_server_status_changed)
         self.engine.start()
