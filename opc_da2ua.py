@@ -123,6 +123,7 @@ DEFAULT_FOLDER = "Default"
 
 write_queues = {}
 async_loop = None
+da_written_values = {}  # Shared dict: nodeid -> value, updated by DA worker to suppress echo writes
 CERT_FILE = "server_cert.pem"
 KEY_FILE = "server_key.pem"
 
@@ -362,10 +363,9 @@ async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event):
 
     asyncua 1.1.0 does not have set_data_value_callback on the address space,
     so we periodically read each variable's value and compare it against the
-    last known value. When a difference is detected we assume a UA client
-    wrote to it and forward the value to the DA write queue.
+    last known value. Changes that match what the DA worker wrote are skipped
+    to avoid echo writes back to DA.
     """
-    # Snapshot of last-known values per node
     last_values = {}
     poll_interval = 0.25  # seconds
     while not stop_event.is_set():
@@ -379,7 +379,12 @@ async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event):
                 if prev is None:
                     last_values[nodeid] = current
                     continue
-                # Only forward if value changed (external write)
+                # Skip if the change was made by the DA worker itself
+                da_val = da_written_values.get(nodeid)
+                if da_val is not None and current == da_val:
+                    last_values[nodeid] = current
+                    continue
+                # Only forward if value changed (external UA client write)
                 if current != prev:
                     last_values[nodeid] = current
                     handler.route_write(nodeid, current)
@@ -578,8 +583,10 @@ def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status
                 # Subscription mode – read returns only changed values
                 for tname, val, qual, ts in da_client.read(tags):
                     if qual == "Good" and async_loop:
+                        node = ua_variables[tname]
+                        da_written_values[node.nodeid] = val
                         asyncio.run_coroutine_threadsafe(
-                            ua_variables[tname].write_value(val), async_loop
+                            node.write_value(val), async_loop
                         )
                 time.sleep(max(poll_interval / 10, 0.05))
             else:
@@ -587,8 +594,10 @@ def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status
                 for chunk in chunks:
                     for tname, val, qual, ts in da_client.read(chunk):
                         if qual == "Good" and async_loop:
+                            node = ua_variables[tname]
+                            da_written_values[node.nodeid] = val
                             asyncio.run_coroutine_threadsafe(
-                                ua_variables[tname].write_value(val), async_loop
+                                node.write_value(val), async_loop
                             )
                 time.sleep(poll_interval)
         except Exception as e:
