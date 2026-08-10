@@ -358,6 +358,16 @@ class MultiServerWriteHandler:
         logger.info(f"Queued write [{server_name}] -> {da_tag} = {val}")
 
 
+async def _da_write_ua(node, val):
+    """Write a value to a UA variable and record it as DA-originated.
+
+    This runs inside the async loop so the write and the da_written_values
+    update happen atomically from the monitor's perspective.
+    """
+    await node.write_value(val)
+    da_written_values[node.nodeid] = val
+
+
 async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event):
     """Poll UA variables for externally-written values and route them to DA.
 
@@ -584,9 +594,8 @@ def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status
                 for tname, val, qual, ts in da_client.read(tags):
                     if qual == "Good" and async_loop:
                         node = ua_variables[tname]
-                        da_written_values[node.nodeid] = val
                         asyncio.run_coroutine_threadsafe(
-                            node.write_value(val), async_loop
+                            _da_write_ua(node, val), async_loop
                         )
                 time.sleep(max(poll_interval / 10, 0.05))
             else:
@@ -595,9 +604,8 @@ def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status
                     for tname, val, qual, ts in da_client.read(chunk):
                         if qual == "Good" and async_loop:
                             node = ua_variables[tname]
-                            da_written_values[node.nodeid] = val
                             asyncio.run_coroutine_threadsafe(
-                                node.write_value(val), async_loop
+                                _da_write_ua(node, val), async_loop
                             )
                 time.sleep(poll_interval)
         except Exception as e:
