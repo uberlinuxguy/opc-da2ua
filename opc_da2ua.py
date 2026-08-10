@@ -568,6 +568,7 @@ def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status
             while not my_queue.empty():
                 tag, val = my_queue.get_nowait()
                 try:
+                    logger.error(f"[{server_name}] writing {tag} = {val}")
                     da_client.write((tag, val))  # type: ignore[union-attr]
                 except Exception as e:
                     logger.error(f"[{server_name}] write {tag}: {e}")
