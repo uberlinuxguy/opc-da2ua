@@ -34,6 +34,7 @@ if getattr(sys, 'frozen', False):
 
 import asyncio
 import csv
+import gc
 import ipaddress
 import json
 import logging
@@ -345,6 +346,7 @@ class GatewayEngine(QThread):
         for srv in self._server_names:
             write_queues.pop(srv, None)
         da_written_values.clear()
+        logger.debug("Gateway engine cleanup complete: write_queues and da_written_values cleared")
 
 
 # ===================================================================
@@ -392,9 +394,13 @@ async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event):
     """
     last_values = {}
     poll_interval = 0.25  # seconds
+    prune_interval = 60  # seconds between da_written_values pruning
+    last_prune = time.monotonic()
     while not stop_event.is_set():
         await asyncio.sleep(poll_interval)
         try:
+            # Build set of current node IDs for cleanup
+            current_nodeids = {node.nodeid for node in ua_vars.values()}
             for da_tag, node in ua_vars.items():
                 nodeid = node.nodeid
                 dv = await node.read_value()
@@ -412,10 +418,25 @@ async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event):
                 if current != prev:
                     last_values[nodeid] = current
                     handler.route_write(nodeid, current)
+
+            # Periodically prune da_written_values to prevent unbounded growth
+            now = time.monotonic()
+            if now - last_prune > prune_interval:
+                _prune_da_written_values(current_nodeids)
+                last_prune = now
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.debug(f"Write monitor poll error: {e}")
+
+
+def _prune_da_written_values(current_nodeids):
+    """Remove stale entries from da_written_values that no longer have corresponding nodes."""
+    stale_keys = [k for k in da_written_values if k not in current_nodeids]
+    for k in stale_keys:
+        del da_written_values[k]
+    if stale_keys:
+        logger.debug(f"Pruned {len(stale_keys)} stale entries from da_written_values")
 
 
 def _interruptible_sleep(duration, stop_event=None):
@@ -584,6 +605,10 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
 
     # Track time for periodic reinitialization
     last_reinit_time = time.monotonic() if reinit_interval > 0 else None
+    
+    # Track time for periodic garbage collection
+    gc_interval = 60  # seconds between GC runs
+    last_gc_time = time.monotonic()
 
     def cleanup_subscription():
         """Safely unsubscribe and clean up subscription state."""
@@ -631,6 +656,12 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
             pass
 
     while stop_event is None or not stop_event.is_set():
+        # Periodic garbage collection to clean up COM object references
+        now = time.monotonic()
+        if now - last_gc_time > gc_interval:
+            gc.collect()
+            last_gc_time = now
+
         # Check if it's time for periodic reinitialization
         if reinit_interval > 0 and last_reinit_time is not None and connected:
             elapsed = time.monotonic() - last_reinit_time
@@ -1533,21 +1564,35 @@ class MainWindow(QMainWindow):
     # Helpers
     # ------------------------------------------------------------------
     def _log(self, msg):
-        self.log_view.append(msg)
         # Cap log lines to prevent unbounded memory growth (0 = disabled)
         max_lines = self.prefs.get("max_log_lines", DEFAULT_MAX_LOG_LINES)
-        if max_lines <= 0:
-            return
         doc = self.log_view.document()
-        if doc.lineCount() > max_lines:
-            # Remove oldest lines (keep the most recent 2500)
-            cursor = QTextCursor(doc)
-            cursor.movePosition(QTextCursor.Start)
-            block = doc.findBlockByNumber(0)
-            end_block = doc.findBlockByNumber(doc.blockCount() - max_lines + 1)
-            cursor.setPosition(block.position())
-            cursor.setPosition(end_block.position(), QTextCursor.KeepAnchor)
-            cursor.removeSelectedText()
+
+        # If we're over the limit, trim before appending
+        if max_lines > 0 and doc.lineCount() >= max_lines:
+            # Get all blocks and find where to start keeping
+            start_block_num = doc.blockCount() - max_lines + 1
+            start_block = doc.findBlockByNumber(start_block_num)
+            
+            # Collect text from blocks we want to keep
+            kept_lines = []
+            block = start_block
+            while block.isValid():
+                kept_lines.append(block.text())
+                block = block.next()
+            
+            # Clear document and disable undo to free memory
+            self.log_view.setUndoRedoEnabled(False)
+            self.log_view.clear()
+            self.log_view.setUndoRedoEnabled(True)
+            
+            # Restore kept content and append new message
+            for line in kept_lines:
+                self.log_view.append(line)
+            self.log_view.append(msg)
+            return
+
+        self.log_view.append(msg)
 
     def _on_server_status_changed(self, server_name, connected):
         """Update server status in the tree when connection state changes."""
