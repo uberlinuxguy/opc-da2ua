@@ -56,7 +56,7 @@ from PySide2.QtWidgets import (
     QAction, QRadioButton, QCheckBox,
 )
 from PySide2.QtCore import Qt, Slot, QThread, QTimer, Signal
-from PySide2.QtGui import QFont, QColor
+from PySide2.QtGui import QFont, QColor, QTextCursor
 
 # ---------------------------------------------------------------------------
 # Custom logging – routes to file + Qt log pane
@@ -138,6 +138,7 @@ DEFAULT_SSL_ENABLED = False
 DEFAULT_CHUNK_SIZE_PREF = DEFAULT_CHUNK_SIZE
 DEFAULT_POLL_INTERVAL_PREF = DEFAULT_POLL_INTERVAL
 DEFAULT_DA_MODE_PREF = DEFAULT_DA_MODE
+DEFAULT_MAX_LOG_LINES = 5000
 
 
 def load_preferences():
@@ -148,6 +149,7 @@ def load_preferences():
         "chunk_size": DEFAULT_CHUNK_SIZE_PREF,
         "poll_interval": DEFAULT_POLL_INTERVAL_PREF,
         "da_mode": DEFAULT_DA_MODE_PREF,
+        "max_log_lines": DEFAULT_MAX_LOG_LINES,
     }
     if os.path.exists(PREFERENCES_FILE):
         try:
@@ -180,9 +182,10 @@ def apply_preferences(prefs=None):
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
-    # Remove old handlers
+    # Remove old handlers (close file handles to prevent leaks)
     for h in root.handlers[:]:
         root.removeHandler(h)
+        h.close()
 
     fmt = logging.Formatter(
         '%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s',
@@ -220,6 +223,7 @@ class GatewayEngine(QThread):
         self.config = config          # { server_name: { folder: [tag, ...] } }
         self._ua_server = None
         self._stop_event = threading.Event()
+        self._server_names = []  # Track which servers this engine created queues for
 
     # -- QThread.run --------------------------------------------------------
     def run(self):
@@ -261,6 +265,7 @@ class GatewayEngine(QThread):
                 continue
 
             write_queues[srv] = Queue()
+            self._server_names.append(srv)
             clean = srv.replace(".", "_").replace(" ", "_")
             srv_node = await root.add_object(root_idx, f"Server_{clean}")
             status_node = await srv_node.add_variable(root_idx, "IsConnected", 0.0)
@@ -331,6 +336,11 @@ class GatewayEngine(QThread):
                 except asyncio.CancelledError:
                     pass
         self.log_signal.emit("OPC UA server stopped.")
+
+        # Clean up global state to prevent memory leaks
+        for srv in self._server_names:
+            write_queues.pop(srv, None)
+        da_written_values.clear()
 
 
 # ===================================================================
@@ -532,6 +542,20 @@ def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status
                    da_mode=DEFAULT_DA_MODE):
     global async_loop
     pythoncom.CoInitialize()
+    try:
+        _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_status_signal,
+                             chunk_size, poll_interval, da_mode)
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+
+def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_status_signal,
+                         chunk_size=DEFAULT_CHUNK_SIZE, poll_interval=DEFAULT_POLL_INTERVAL,
+                         da_mode=DEFAULT_DA_MODE):
+    global async_loop
     my_queue = write_queues[server_name]
     chunks = [tags[i:i + chunk_size] for i in range(0, len(tags), chunk_size)]
     da_client = None
@@ -899,6 +923,26 @@ class PreferencesDialog(QDialog):
 
         layout.addWidget(da_group)
 
+        # Log Display Group
+        log_group = QGroupBox("Log Display")
+        log_grp_layout = QFormLayout(log_group)
+
+        self.max_log_lines_edit = QLineEdit(
+            str(self.prefs.get("max_log_lines", DEFAULT_MAX_LOG_LINES))
+        )
+        self.max_log_lines_edit.setPlaceholderText(str(DEFAULT_MAX_LOG_LINES))
+        max_lines_label = QLabel("Max log lines in GUI:")
+        log_grp_layout.addRow(max_lines_label, self.max_log_lines_edit)
+
+        max_lines_hint = QLabel(
+            "Older lines are automatically removed to keep the UI responsive.\n"
+            "Set to 0 to disable (not recommended for long runs)."
+        )
+        max_lines_hint.setStyleSheet("color: gray; font-size: small;")
+        log_grp_layout.addRow(max_lines_hint)
+
+        layout.addWidget(log_group)
+
         # Description
         desc = QLabel(
             "Log output is written to both the Gateway Log pane and the log file."
@@ -979,6 +1023,14 @@ class PreferencesDialog(QDialog):
         except ValueError:
             chunk_size = DEFAULT_CHUNK_SIZE
 
+        # Max log lines
+        try:
+            max_log_lines = int(self.max_log_lines_edit.text().strip())
+            if max_log_lines < 0:
+                max_log_lines = DEFAULT_MAX_LOG_LINES
+        except ValueError:
+            max_log_lines = DEFAULT_MAX_LOG_LINES
+
         return {
             "log_level": level,
             "log_file": log_file,
@@ -986,6 +1038,7 @@ class PreferencesDialog(QDialog):
             "da_mode": da_mode,
             "poll_interval": poll_interval,
             "chunk_size": chunk_size,
+            "max_log_lines": max_log_lines,
         }
 
 
@@ -1372,8 +1425,9 @@ class MainWindow(QMainWindow):
         if not self.config:
             QMessageBox.warning(self, "No Config", "Add at least one server before starting.")
             return
+        # Stop any existing engine before starting a new one
         if self.engine and self.engine.isRunning():
-            return
+            self._stop_gateway()
         self.engine = GatewayEngine(dict(self.config))
         self.engine.setObjectName("OPCUA-1")
         self.engine.config["__ssl_enabled__"] = self.prefs.get("ssl_enabled", DEFAULT_SSL_ENABLED)
@@ -1398,6 +1452,7 @@ class MainWindow(QMainWindow):
             if self.engine.isRunning():
                 self.engine.terminate()
                 self.engine.wait(3000)
+            self.engine.deleteLater()
             self.engine = None
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
@@ -1409,6 +1464,20 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _log(self, msg):
         self.log_view.append(msg)
+        # Cap log lines to prevent unbounded memory growth (0 = disabled)
+        max_lines = self.prefs.get("max_log_lines", DEFAULT_MAX_LOG_LINES)
+        if max_lines <= 0:
+            return
+        doc = self.log_view.document()
+        if doc.lineCount() > max_lines:
+            # Remove oldest lines (keep the most recent 2500)
+            cursor = QTextCursor(doc)
+            cursor.movePosition(QTextCursor.Start)
+            block = doc.findBlockByNumber(0)
+            end_block = doc.findBlockByNumber(doc.blockCount() - max_lines + 1)
+            cursor.setPosition(block.position())
+            cursor.setPosition(end_block.position(), QTextCursor.KeepAnchor)
+            cursor.removeSelectedText()
 
     def _on_server_status_changed(self, server_name, connected):
         """Update server status in the tree when connection state changes."""
