@@ -391,7 +391,19 @@ async def _da_write_ua(node, val):
     update happen atomically from the monitor's perspective.
     """
     await node.write_value(val)
-    da_written_values[node.nodeid] = val
+    da_written_values[node.nodeid] = (val, time.monotonic())
+
+
+async def _da_write_ua_batch_impl(write_list):
+    """Execute a batch of writes inside the async loop (single Future)."""
+    for node, val in write_list:
+        await node.write_value(val)
+        da_written_values[node.nodeid] = (val, time.monotonic())
+
+
+def _da_write_ua_batch(write_list):
+    """Schedule a batch of UA writes on the async loop as a single Future."""
+    return asyncio.run_coroutine_threadsafe(_da_write_ua_batch_impl(write_list), async_loop)
 
 
 async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event):
@@ -402,15 +414,15 @@ async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event):
     last known value. Changes that match what the DA worker wrote are skipped
     to avoid echo writes back to DA.
     """
-    last_values = {}
-    poll_interval = 0.25  # seconds
-    prune_interval = 60  # seconds between da_written_values pruning
+    last_values = {}  # nodeid -> value
+    poll_interval = 0.5  # seconds (increased from 0.25 to reduce overhead)
+    prune_interval = 30  # seconds between pruning
     last_prune = time.monotonic()
+    current_nodeids = frozenset(node.nodeid for node in ua_vars.values())
+
     while not stop_event.is_set():
         await asyncio.sleep(poll_interval)
         try:
-            # Build set of current node IDs for cleanup
-            current_nodeids = {node.nodeid for node in ua_vars.values()}
             for da_tag, node in ua_vars.items():
                 nodeid = node.nodeid
                 dv = await node.read_value()
@@ -420,19 +432,25 @@ async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event):
                     last_values[nodeid] = current
                     continue
                 # Skip if the change was made by the DA worker itself
-                da_val = da_written_values.get(nodeid)
-                if da_val is not None and current == da_val:
-                    last_values[nodeid] = current
-                    continue
+                da_entry = da_written_values.get(nodeid)
+                if da_entry is not None:
+                    da_val = da_entry[0]  # value is stored as (val, timestamp)
+                    if current == da_val:
+                        last_values[nodeid] = current
+                        continue
                 # Only forward if value changed (external UA client write)
                 if current != prev:
                     last_values[nodeid] = current
                     handler.route_write(nodeid, current)
 
-            # Periodically prune da_written_values to prevent unbounded growth
+            # Periodically prune stale entries
             now = time.monotonic()
             if now - last_prune > prune_interval:
                 _prune_da_written_values(current_nodeids)
+                # Also prune last_values for removed nodes
+                stale_last = [k for k in last_values if k not in current_nodeids]
+                for k in stale_last:
+                    del last_values[k]
                 last_prune = now
         except asyncio.CancelledError:
             raise
@@ -441,12 +459,24 @@ async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event):
 
 
 def _prune_da_written_values(current_nodeids):
-    """Remove stale entries from da_written_values that no longer have corresponding nodes."""
-    stale_keys = [k for k in da_written_values if k not in current_nodeids]
-    for k in stale_keys:
+    """Remove stale entries from da_written_values.
+
+    Entries are stored as (value, timestamp) and are pruned if:
+    1. The node no longer exists, OR
+    2. The entry is older than 5 seconds (echo suppression only needs to be brief)
+    """
+    now = time.monotonic()
+    max_age = 5.0  # seconds
+    keys_to_remove = []
+    for k, v in da_written_values.items():
+        if k not in current_nodeids:
+            keys_to_remove.append(k)
+        elif now - v[1] > max_age:
+            keys_to_remove.append(k)
+    for k in keys_to_remove:
         del da_written_values[k]
-    if stale_keys:
-        logger.debug(f"Pruned {len(stale_keys)} stale entries from da_written_values")
+    if keys_to_remove:
+        logger.debug(f"Pruned {len(keys_to_remove)} stale entries from da_written_values")
 
 
 def _interruptible_sleep(duration, stop_event=None):
@@ -479,6 +509,19 @@ def log_memory_usage(logger, tag=""):
     if mem_mb is not None:
         tag_str = f" [{tag}]" if tag else ""
         logger.info(f"Memory usage{tag_str}: {mem_mb:.1f} MB")
+
+
+def _count_objects_by_type():
+    """Count live objects by type for memory diagnostics."""
+    import sys
+    counts = {}
+    for obj in gc.get_objects():
+        try:
+            tname = type(obj).__name__
+            counts[tname] = counts.get(tname, 0) + 1
+        except (TypeError, ReferenceError):
+            pass
+    return counts
 
 
 def load_csv(path):
@@ -758,31 +801,46 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
 
             if da_mode == "subscription" and subscribed:
                 # Subscription mode – read returns only changed values
-                # Use a short sleep as a timeout mechanism to detect stale subscriptions
-                read_result = None
+                # Batch all writes into a single async call to avoid Future accumulation
+                write_batch = []
                 try:
                     for tname, val, qual, ts in da_client.read(tags):
-                        if qual == "Good" and async_loop:
+                        if qual == "Good":
                             node = ua_variables[tname]
-                            asyncio.run_coroutine_threadsafe(
-                                _da_write_ua(node, val), async_loop
-                            )
+                            write_batch.append((node, val))
                         elif qual != "Good":
                             logger.debug(f"[{server_name}] tag {tname} quality: {qual}")
                 except Exception as e:
                     # Subscription read failed – likely a disconnect
                     raise
 
+                # Submit all writes as a single batch (one Future instead of N)
+                if write_batch and async_loop:
+                    future = _da_write_ua_batch(write_batch)
+                    # Wait for the batch to complete with a timeout to prevent queue buildup
+                    try:
+                        future.result(timeout=2.0)
+                    except Exception as e:
+                        logger.warning(f"[{server_name}] batch write error: {e}")
+
                 time.sleep(max(poll_interval / 10, 0.05))
             else:
-                # Polling mode – read all tags in chunks
+                # Polling mode – read all tags in chunks and batch writes
                 for chunk in chunks:
+                    write_batch = []
                     for tname, val, qual, ts in da_client.read(chunk):
-                        if qual == "Good" and async_loop:
+                        if qual == "Good":
                             node = ua_variables[tname]
-                            asyncio.run_coroutine_threadsafe(
-                                _da_write_ua(node, val), async_loop
-                            )
+                            write_batch.append((node, val))
+
+                    # Submit batch (one Future per chunk instead of one per tag)
+                    if write_batch and async_loop:
+                        future = _da_write_ua_batch(write_batch)
+                        try:
+                            future.result(timeout=2.0)
+                        except Exception as e:
+                            logger.warning(f"[{server_name}] batch write error: {e}")
+
                 _interruptible_sleep(poll_interval, stop_event)
         except Exception as e:
             logger.error(f"[{server_name}] connection error: {e}")
@@ -1358,14 +1416,37 @@ class MainWindow(QMainWindow):
         tb.addAction("🧹 Force GC", lambda: self._force_gc())
 
     def _force_gc(self):
-        """Manually trigger garbage collection and log memory before/after."""
+        """Manually trigger garbage collection and log detailed memory diagnostics."""
         mem_before = get_memory_usage_mb()
+        
+        # Count objects of common leak-suspect types before GC
+        type_counts_before = _count_objects_by_type()
+        
         collected = gc.collect()
+        collected_pass2 = gc.collect()
+        collected_pass3 = gc.collect()
+        total_collected = collected + collected_pass2 + collected_pass3
+        
         mem_after = get_memory_usage_mb()
+        
+        # Count objects after GC
+        type_counts_after = _count_objects_by_type()
+        
         if mem_before is not None and mem_after is not None:
-            self._log(f"Force GC: collected {collected} objects, {mem_before:.1f} MB → {mem_after:.1f} MB (freed {mem_before - mem_after:.1f} MB)")
+            self._log(f"Force GC: collected {total_collected} objects (pass1:{collected} pass2:{collected_pass2} pass3:{collected_pass3})")
+            self._log(f"  Memory: {mem_before:.1f} MB → {mem_after:.1f} MB (freed {mem_before - mem_after:.1f} MB)")
+            
+            # Show object count changes
+            self._log(f"  Object counts (before → after [delta]):")
+            for ttype in sorted(type_counts_before.keys()):
+                before = type_counts_before[ttype]
+                after = type_counts_after.get(ttype, 0)
+                delta = after - before
+                if before > 0 or after > 0:
+                    self._log(f"    {ttype}: {before} → {after} [{delta:+d}]")
         else:
-            self._log(f"Force GC: collected {collected} objects (psutil not available for memory tracking)")
+            self._log(f"Force GC: collected {total_collected} objects (psutil not available)")
+        
         # Update memory status immediately
         self._update_memory_status()
 
