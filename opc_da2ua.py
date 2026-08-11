@@ -38,12 +38,19 @@ import gc
 import ipaddress
 import json
 import logging
+import os
 import signal
 import ssl
 import threading
 import time
 from datetime import datetime, timedelta
 from queue import Queue
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
 import OpenOPC
 import pythoncom
@@ -319,6 +326,8 @@ class GatewayEngine(QThread):
             t.start()
 
         handler = MultiServerWriteHandler(tag_routing_map)
+        # Log memory usage after setup
+        log_memory_usage(logger, "gateway-start")
         # Start a background monitor for UA write requests (asyncua 1.1.0 lacks
         # set_data_value_callback, so we poll the variables for external writes)
         self._write_monitor_task = asyncio.create_task(
@@ -347,6 +356,7 @@ class GatewayEngine(QThread):
             write_queues.pop(srv, None)
         da_written_values.clear()
         logger.debug("Gateway engine cleanup complete: write_queues and da_written_values cleared")
+        log_memory_usage(logger, "gateway-stop")
 
 
 # ===================================================================
@@ -450,6 +460,25 @@ def _interruptible_sleep(duration, stop_event=None):
         if stop_event.is_set():
             return
         time.sleep(min(0.1, end - time.monotonic()))
+
+
+def get_memory_usage_mb():
+    """Get current process memory usage in MB."""
+    if not HAS_PSUTIL:
+        return None
+    try:
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / (1024 * 1024)
+    except Exception:
+        return None
+
+
+def log_memory_usage(logger, tag=""):
+    """Log current memory usage if psutil is available."""
+    mem_mb = get_memory_usage_mb()
+    if mem_mb is not None:
+        tag_str = f" [{tag}]" if tag else ""
+        logger.info(f"Memory usage{tag_str}: {mem_mb:.1f} MB")
 
 
 def load_csv(path):
@@ -606,9 +635,12 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
     # Track time for periodic reinitialization
     last_reinit_time = time.monotonic() if reinit_interval > 0 else None
     
-    # Track time for periodic garbage collection
+    # Track time for periodic garbage collection and memory logging
     gc_interval = 60  # seconds between GC runs
     last_gc_time = time.monotonic()
+    
+    # Log initial memory usage
+    log_memory_usage(logger, server_name)
 
     def cleanup_subscription():
         """Safely unsubscribe and clean up subscription state."""
@@ -659,7 +691,11 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
         # Periodic garbage collection to clean up COM object references
         now = time.monotonic()
         if now - last_gc_time > gc_interval:
+            mem_before = get_memory_usage_mb()
             gc.collect()
+            mem_after = get_memory_usage_mb()
+            if mem_before is not None and mem_after is not None:
+                logger.info(f"[{server_name}] GC: {mem_before:.1f} MB → {mem_after:.1f} MB (freed {mem_before - mem_after:.1f} MB)")
             last_gc_time = now
 
         # Check if it's time for periodic reinitialization
@@ -667,6 +703,7 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
             elapsed = time.monotonic() - last_reinit_time
             if elapsed >= reinit_interval:
                 logger.info(f"[{server_name}] periodic reinitialization triggered (interval={reinit_interval}s)")
+                log_memory_usage(logger, server_name)
                 cleanup_connection()
                 last_reinit_time = time.monotonic()
                 connected = False
@@ -755,6 +792,7 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
 
     # Clean shutdown – stop event was set
     logger.info(f"[{server_name}] worker shutting down cleanly")
+    log_memory_usage(logger, server_name)
     cleanup_connection()
 
 
@@ -1167,6 +1205,11 @@ class MainWindow(QMainWindow):
         # Wire Qt log handler to log_view (after apply_preferences creates qthandler)
         qthandler.set_signal(self._log_signal)
 
+        # Memory monitoring timer (updates status bar every 30 seconds)
+        self._memory_timer = QTimer(self)
+        self._memory_timer.timeout.connect(self._update_memory_status)
+        self._memory_timer.start(30000)  # 30 seconds
+
         self._load_default_csv()
 
         self.statusBar().showMessage("Ready")
@@ -1311,6 +1354,20 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         tb.addAction("Load CSV", lambda: self._load_csv_dialog())
         tb.addAction("Save CSV", lambda: self._save_csv())
+        tb.addSeparator()
+        tb.addAction("🧹 Force GC", lambda: self._force_gc())
+
+    def _force_gc(self):
+        """Manually trigger garbage collection and log memory before/after."""
+        mem_before = get_memory_usage_mb()
+        collected = gc.collect()
+        mem_after = get_memory_usage_mb()
+        if mem_before is not None and mem_after is not None:
+            self._log(f"Force GC: collected {collected} objects, {mem_before:.1f} MB → {mem_after:.1f} MB (freed {mem_before - mem_after:.1f} MB)")
+        else:
+            self._log(f"Force GC: collected {collected} objects (psutil not available for memory tracking)")
+        # Update memory status immediately
+        self._update_memory_status()
 
     # ------------------------------------------------------------------
     # Tree management
@@ -1609,6 +1666,16 @@ class MainWindow(QMainWindow):
             else:
                 item.setText(2, "Bad")
                 item.setForeground(2, QColor("#c62828"))  # Red
+
+    def _update_memory_status(self):
+        """Update status bar with current memory usage."""
+        mem_mb = get_memory_usage_mb()
+        if mem_mb is not None:
+            # Show memory in status bar permanently
+            if not hasattr(self, '_memory_label'):
+                self._memory_label = QLabel()
+                self.statusBar().addPermanentWidget(self._memory_label)
+            self._memory_label.setText(f"Memory: {mem_mb:.1f} MB")
 
     def _open_preferences(self):
         dlg = PreferencesDialog(self)
