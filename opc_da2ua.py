@@ -1132,18 +1132,16 @@ class MainWindow(QMainWindow):
 
         btn_bar.addStretch()
 
-        self.btn_save = QPushButton("💾  Save CSV")
-        self.btn_save.clicked.connect(self._save_csv)
-        btn_bar.addWidget(self.btn_save)
-
         main_layout.addLayout(btn_bar)
 
         # Style
         self.setStyleSheet("""
             #startBtn { background: #2e7d32; color: white; padding: 6px 16px; border-radius: 4px; font-weight: bold; }
             #startBtn:hover { background: #388e3c; }
+            #startBtn:disabled { background: #a5d6a7; color: #616161; }
             #stopBtn { background: #c62828; color: white; padding: 6px 16px; border-radius: 4px; font-weight: bold; }
             #stopBtn:hover { background: #d32f2f; }
+            #stopBtn:disabled { background: #ef9a9a; color: #616161; }
             QTreeWidget::item { height: 24px; }
             QGroupBox { font-weight: bold; border: 1px solid #ccc; margin-top: 8px; padding-top: 8px; }
         """)
@@ -1243,7 +1241,7 @@ class MainWindow(QMainWindow):
                     tag_item = QTreeWidgetItem(folder_item, [tag, "Tag", ""])
                     tag_item.setForeground(0, QColor("#333"))
 
-        self.tree.expandAll()
+        self.tree.collapseAll()
         self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
 
     # ------------------------------------------------------------------
