@@ -1147,6 +1147,11 @@ class MainWindow(QMainWindow):
         self.btn_stop.clicked.connect(self._stop_gateway)
         btn_bar.addWidget(self.btn_stop)
 
+        self.btn_clear_log = QPushButton("🗑  Clear Log")
+        self.btn_clear_log.setObjectName("clearLogBtn")
+        self.btn_clear_log.clicked.connect(self._clear_log)
+        btn_bar.addWidget(self.btn_clear_log)
+
         btn_bar.addStretch()
 
         main_layout.addLayout(btn_bar)
@@ -1159,6 +1164,8 @@ class MainWindow(QMainWindow):
             #stopBtn { background: #c62828; color: white; padding: 6px 16px; border-radius: 4px; font-weight: bold; }
             #stopBtn:hover { background: #d32f2f; }
             #stopBtn:disabled { background: #ef9a9a; color: #616161; }
+            #clearLogBtn { background: #546e7a; color: white; padding: 6px 16px; border-radius: 4px; font-weight: bold; }
+            #clearLogBtn:hover { background: #607d8b; }
             QTreeWidget::item { height: 24px; }
             QGroupBox { font-weight: bold; border: 1px solid #ccc; margin-top: 8px; padding-top: 8px; }
         """)
@@ -1473,6 +1480,10 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self._log("Gateway stopped.")
         self.statusBar().showMessage("Gateway stopped")
+
+    @Slot()
+    def _clear_log(self):
+        self.log_view.clear()
 
     # ------------------------------------------------------------------
     # Helpers
