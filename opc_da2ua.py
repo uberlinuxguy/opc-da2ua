@@ -307,7 +307,7 @@ class GatewayEngine(QThread):
             t = threading.Thread(
                 target=opc_da_worker,
                 args=(srv, all_tags, srv_ua_vars, status_node, self.server_status_signal,
-                      chunk_size, poll_interval, da_mode),
+                      chunk_size, poll_interval, da_mode, self._stop_event),
                 name=f"Worker_{clean}",
                 daemon=True,
             )
@@ -412,6 +412,19 @@ async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event):
             raise
         except Exception as e:
             logger.debug(f"Write monitor poll error: {e}")
+
+
+def _interruptible_sleep(duration, stop_event=None):
+    """Sleep for *duration* seconds, but wake early if stop_event is set."""
+    if stop_event is None:
+        time.sleep(duration)
+        return
+    # Sleep in 100 ms increments so we can check the event
+    end = time.monotonic() + duration
+    while time.monotonic() < end:
+        if stop_event.is_set():
+            return
+        time.sleep(min(0.1, end - time.monotonic()))
 
 
 def load_csv(path):
@@ -539,12 +552,12 @@ def _probe_da_types(server_name, tags):
 
 def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status_signal,
                    chunk_size=DEFAULT_CHUNK_SIZE, poll_interval=DEFAULT_POLL_INTERVAL,
-                   da_mode=DEFAULT_DA_MODE):
+                   da_mode=DEFAULT_DA_MODE, stop_event=None):
     global async_loop
     pythoncom.CoInitialize()
     try:
         _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_status_signal,
-                             chunk_size, poll_interval, da_mode)
+                             chunk_size, poll_interval, da_mode, stop_event)
     finally:
         try:
             pythoncom.CoUninitialize()
@@ -554,7 +567,7 @@ def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status
 
 def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_status_signal,
                          chunk_size=DEFAULT_CHUNK_SIZE, poll_interval=DEFAULT_POLL_INTERVAL,
-                         da_mode=DEFAULT_DA_MODE):
+                         da_mode=DEFAULT_DA_MODE, stop_event=None):
     global async_loop
     my_queue = write_queues[server_name]
     chunks = [tags[i:i + chunk_size] for i in range(0, len(tags), chunk_size)]
@@ -608,7 +621,7 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
         except RuntimeError:
             pass
 
-    while True:
+    while stop_event is None or not stop_event.is_set():
         if not connected:
             # Show disconnected status before attempting reconnect
             update_ua_status(0.0)
@@ -640,7 +653,7 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
             except Exception as e:
                 logger.error(f"Connect [{server_name}] failed: {e}")
                 da_client = None
-                time.sleep(RECONNECT_DELAY)
+                _interruptible_sleep(RECONNECT_DELAY, stop_event)
                 continue
 
         try:
@@ -683,12 +696,16 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                             asyncio.run_coroutine_threadsafe(
                                 _da_write_ua(node, val), async_loop
                             )
-                time.sleep(poll_interval)
+                _interruptible_sleep(poll_interval, stop_event)
         except Exception as e:
             logger.error(f"[{server_name}] connection error: {e}")
             cleanup_connection()
             reconnect_count += 1
-            time.sleep(RECONNECT_DELAY)
+            _interruptible_sleep(RECONNECT_DELAY, stop_event)
+
+    # Clean shutdown – stop event was set
+    logger.info(f"[{server_name}] worker shutting down cleanly")
+    cleanup_connection()
 
 
 # ===================================================================
