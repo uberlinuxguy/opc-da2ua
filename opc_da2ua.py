@@ -120,6 +120,7 @@ DEFAULT_POLL_INTERVAL = 0.5
 DEFAULT_DA_MODE = "polling"  # "polling" or "subscription"
 RECONNECT_DELAY = 5.0
 DEFAULT_FOLDER = "Default"
+DEFAULT_REINIT_INTERVAL = 5400.0  # 1.5 hours in seconds
 
 write_queues = {}
 async_loop = None
@@ -139,6 +140,7 @@ DEFAULT_CHUNK_SIZE_PREF = DEFAULT_CHUNK_SIZE
 DEFAULT_POLL_INTERVAL_PREF = DEFAULT_POLL_INTERVAL
 DEFAULT_DA_MODE_PREF = DEFAULT_DA_MODE
 DEFAULT_MAX_LOG_LINES = 5000
+DEFAULT_REINIT_INTERVAL_PREF = DEFAULT_REINIT_INTERVAL
 
 
 def load_preferences():
@@ -150,6 +152,7 @@ def load_preferences():
         "poll_interval": DEFAULT_POLL_INTERVAL_PREF,
         "da_mode": DEFAULT_DA_MODE_PREF,
         "max_log_lines": DEFAULT_MAX_LOG_LINES,
+        "reinit_interval": DEFAULT_REINIT_INTERVAL_PREF,
     }
     if os.path.exists(PREFERENCES_FILE):
         try:
@@ -303,11 +306,12 @@ class GatewayEngine(QThread):
             chunk_size = self.config.get("__chunk_size__", DEFAULT_CHUNK_SIZE)
             poll_interval = self.config.get("__poll_interval__", DEFAULT_POLL_INTERVAL)
             da_mode = self.config.get("__da_mode__", DEFAULT_DA_MODE)
+            reinit_interval = self.config.get("__reinit_interval__", DEFAULT_REINIT_INTERVAL)
 
             t = threading.Thread(
                 target=opc_da_worker,
                 args=(srv, all_tags, srv_ua_vars, status_node, self.server_status_signal,
-                      chunk_size, poll_interval, da_mode, self._stop_event),
+                      chunk_size, poll_interval, da_mode, reinit_interval, self._stop_event),
                 name=f"Worker_{clean}",
                 daemon=True,
             )
@@ -552,12 +556,13 @@ def _probe_da_types(server_name, tags):
 
 def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status_signal,
                    chunk_size=DEFAULT_CHUNK_SIZE, poll_interval=DEFAULT_POLL_INTERVAL,
-                   da_mode=DEFAULT_DA_MODE, stop_event=None):
+                   da_mode=DEFAULT_DA_MODE, reinit_interval=DEFAULT_REINIT_INTERVAL,
+                   stop_event=None):
     global async_loop
     pythoncom.CoInitialize()
     try:
         _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_status_signal,
-                             chunk_size, poll_interval, da_mode, stop_event)
+                             chunk_size, poll_interval, da_mode, reinit_interval, stop_event)
     finally:
         try:
             pythoncom.CoUninitialize()
@@ -567,7 +572,8 @@ def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status
 
 def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_status_signal,
                          chunk_size=DEFAULT_CHUNK_SIZE, poll_interval=DEFAULT_POLL_INTERVAL,
-                         da_mode=DEFAULT_DA_MODE, stop_event=None):
+                         da_mode=DEFAULT_DA_MODE, reinit_interval=DEFAULT_REINIT_INTERVAL,
+                         stop_event=None):
     global async_loop
     my_queue = write_queues[server_name]
     chunks = [tags[i:i + chunk_size] for i in range(0, len(tags), chunk_size)]
@@ -575,6 +581,9 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
     connected = False
     subscribed = False
     reconnect_count = 0
+
+    # Track time for periodic reinitialization
+    last_reinit_time = time.monotonic() if reinit_interval > 0 else None
 
     def cleanup_subscription():
         """Safely unsubscribe and clean up subscription state."""
@@ -622,6 +631,15 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
             pass
 
     while stop_event is None or not stop_event.is_set():
+        # Check if it's time for periodic reinitialization
+        if reinit_interval > 0 and last_reinit_time is not None and connected:
+            elapsed = time.monotonic() - last_reinit_time
+            if elapsed >= reinit_interval:
+                logger.info(f"[{server_name}] periodic reinitialization triggered (interval={reinit_interval}s)")
+                cleanup_connection()
+                last_reinit_time = time.monotonic()
+                connected = False
+
         if not connected:
             # Show disconnected status before attempting reconnect
             update_ua_status(0.0)
@@ -638,6 +656,7 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                 update_ua_status(1.0)
                 emit_server_status(True)
                 reconnect_count = 0
+                last_reinit_time = time.monotonic()
                 logger.info(f"Connected to [{server_name}]")
 
                 # Subscribe if using subscription mode
@@ -938,6 +957,21 @@ class PreferencesDialog(QDialog):
         chunk_label = QLabel("Chunk size (tags per batch):")
         da_layout.addRow(chunk_label, self.chunk_size_edit)
 
+        # Reinit interval
+        self.reinit_interval_edit = QLineEdit(
+            str(self.prefs.get("reinit_interval", DEFAULT_REINIT_INTERVAL))
+        )
+        self.reinit_interval_edit.setPlaceholderText(str(DEFAULT_REINIT_INTERVAL))
+        reinit_label = QLabel("Connection reinit interval (seconds, 0 to disable):")
+        da_layout.addRow(reinit_label, self.reinit_interval_edit)
+
+        reinit_hint = QLabel(
+            "Periodically reconnects to the DA server to prevent stale connections.\n"
+            "Default is 5400 (1.5 hours). Set to 0 to disable."
+        )
+        reinit_hint.setStyleSheet("color: gray; font-size: small;")
+        da_layout.addRow(reinit_hint)
+
         layout.addWidget(da_group)
 
         # Log Display Group
@@ -1048,6 +1082,14 @@ class PreferencesDialog(QDialog):
         except ValueError:
             max_log_lines = DEFAULT_MAX_LOG_LINES
 
+        # Reinit interval
+        try:
+            reinit_interval = float(self.reinit_interval_edit.text().strip())
+            if reinit_interval < 0:
+                reinit_interval = DEFAULT_REINIT_INTERVAL
+        except ValueError:
+            reinit_interval = DEFAULT_REINIT_INTERVAL
+
         return {
             "log_level": level,
             "log_file": log_file,
@@ -1056,6 +1098,7 @@ class PreferencesDialog(QDialog):
             "poll_interval": poll_interval,
             "chunk_size": chunk_size,
             "max_log_lines": max_log_lines,
+            "reinit_interval": reinit_interval,
         }
 
 
@@ -1456,6 +1499,7 @@ class MainWindow(QMainWindow):
         self.engine.config["__da_mode__"] = self.prefs.get("da_mode", DEFAULT_DA_MODE)
         self.engine.config["__poll_interval__"] = self.prefs.get("poll_interval", DEFAULT_POLL_INTERVAL)
         self.engine.config["__chunk_size__"] = self.prefs.get("chunk_size", DEFAULT_CHUNK_SIZE)
+        self.engine.config["__reinit_interval__"] = self.prefs.get("reinit_interval", DEFAULT_REINIT_INTERVAL)
         self.engine.log_signal.connect(self._log)
         self.engine.server_status_signal.connect(self._on_server_status_changed)
         self.engine.start()
