@@ -537,31 +537,70 @@ def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status
     da_client = None
     connected = False
     subscribed = False
+    reconnect_count = 0
+
+    def cleanup_subscription():
+        """Safely unsubscribe and clean up subscription state."""
+        nonlocal subscribed, da_client
+        if subscribed and da_client:
+            try:
+                da_client.unsubscribe(tags)
+                logger.info(f"[{server_name}] unsubscribed from {len(tags)} tags")
+            except Exception as e:
+                logger.warning(f"[{server_name}] unsubscribe error: {e}")
+            subscribed = False
+
+    def cleanup_connection():
+        """Safely close the DA connection and reset state."""
+        nonlocal connected, da_client
+        cleanup_subscription()
+        connected = False
+        # Emit disconnected status
+        try:
+            server_status_signal.emit(server_name, False)
+        except RuntimeError:
+            pass
+        if da_client:
+            try:
+                da_client.close()
+            except Exception as e:
+                logger.warning(f"[{server_name}] close error during cleanup: {e}")
+            da_client = None
+
+    def update_ua_status(value):
+        """Update the UA status node if the async loop is available."""
+        if async_loop:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    ua_status_node.write_value(value), async_loop
+                )
+            except Exception as e:
+                logger.warning(f"[{server_name}] status update error: {e}")
+
+    def emit_server_status(is_connected):
+        """Emit server status signal safely."""
+        try:
+            server_status_signal.emit(server_name, is_connected)
+        except RuntimeError:
+            pass
 
     while True:
         if not connected:
-            if async_loop:
-                asyncio.run_coroutine_threadsafe(
-                    ua_status_node.write_value(0.0), async_loop
-                )
-            # Emit disconnected status
-            try:
-                server_status_signal.emit(server_name, False)
-            except RuntimeError:
-                pass  # Signal may be disconnected during shutdown
+            # Show disconnected status before attempting reconnect
+            update_ua_status(0.0)
+            emit_server_status(False)
+
+            # Clean up any stale client from previous iteration
+            if da_client:
+                cleanup_connection()
+
             try:
                 da_client = OpenOPC.client()
                 da_client.connect(server_name)
                 connected = True
-                if async_loop:
-                    asyncio.run_coroutine_threadsafe(
-                        ua_status_node.write_value(1.0), async_loop
-                    )
-                # Emit connected status
-                try:
-                    server_status_signal.emit(server_name, True)
-                except RuntimeError:
-                    pass
+                update_ua_status(1.0)
+                emit_server_status(True)
+                reconnect_count = 0
                 logger.info(f"Connected to [{server_name}]")
 
                 # Subscribe if using subscription mode
@@ -576,27 +615,40 @@ def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status
 
             except Exception as e:
                 logger.error(f"Connect [{server_name}] failed: {e}")
+                da_client = None
                 time.sleep(RECONNECT_DELAY)
                 continue
 
         try:
+            # Process pending writes
             while not my_queue.empty():
                 tag, val = my_queue.get_nowait()
                 try:
-                    logger.error(f"[{server_name}] writing {tag} = {val}")
+                    logger.info(f"[{server_name}] writing {tag} = {val}")
                     da_client.write((tag, val))  # type: ignore[union-attr]
                 except Exception as e:
                     logger.error(f"[{server_name}] write {tag}: {e}")
+                    # Write failure may indicate a broken connection
+                    raise
                 my_queue.task_done()
 
             if da_mode == "subscription" and subscribed:
                 # Subscription mode – read returns only changed values
-                for tname, val, qual, ts in da_client.read(tags):
-                    if qual == "Good" and async_loop:
-                        node = ua_variables[tname]
-                        asyncio.run_coroutine_threadsafe(
-                            _da_write_ua(node, val), async_loop
-                        )
+                # Use a short sleep as a timeout mechanism to detect stale subscriptions
+                read_result = None
+                try:
+                    for tname, val, qual, ts in da_client.read(tags):
+                        if qual == "Good" and async_loop:
+                            node = ua_variables[tname]
+                            asyncio.run_coroutine_threadsafe(
+                                _da_write_ua(node, val), async_loop
+                            )
+                        elif qual != "Good":
+                            logger.debug(f"[{server_name}] tag {tname} quality: {qual}")
+                except Exception as e:
+                    # Subscription read failed – likely a disconnect
+                    raise
+
                 time.sleep(max(poll_interval / 10, 0.05))
             else:
                 # Polling mode – read all tags in chunks
@@ -609,25 +661,9 @@ def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status
                             )
                 time.sleep(poll_interval)
         except Exception as e:
-            logger.error(f"[{server_name}] broken: {e}")
-            connected = False
-            # Unsubscribe if we were subscribed
-            if subscribed:
-                try:
-                    da_client.unsubscribe(tags)
-                except Exception:
-                    pass
-                subscribed = False
-            # Emit disconnected status
-            try:
-                server_status_signal.emit(server_name, False)
-            except RuntimeError:
-                pass
-            if da_client:
-                try:
-                    da_client.close()
-                except Exception:
-                    pass
+            logger.error(f"[{server_name}] connection error: {e}")
+            cleanup_connection()
+            reconnect_count += 1
             time.sleep(RECONNECT_DELAY)
 
 
