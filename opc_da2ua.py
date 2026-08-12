@@ -235,6 +235,8 @@ class GatewayEngine(QThread):
         self._ua_server = None
         self._stop_event = threading.Event()
         self._server_names = []  # Track which servers this engine created queues for
+        self._worker_threads = []  # Track worker threads for proper cleanup
+        self._async_loop = None  # Track the async loop for cleanup
 
     # -- QThread.run --------------------------------------------------------
     def run(self):
@@ -243,7 +245,22 @@ class GatewayEngine(QThread):
         asyncio.set_event_loop(loop)
         global async_loop
         async_loop = loop
+        self._async_loop = loop  # Track for cleanup
         loop.run_until_complete(self._async_main())
+        # Clean up the event loop
+        try:
+            # Cancel all remaining tasks
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        except Exception:
+            pass
+        finally:
+            loop.close()
+            async_loop = None
+            self._async_loop = None
 
     async def _async_main(self):
         if not self.config:
@@ -323,6 +340,7 @@ class GatewayEngine(QThread):
                 name=f"Worker_{clean}",
                 daemon=True,
             )
+            self._worker_threads.append(t)
             t.start()
 
         handler = MultiServerWriteHandler(tag_routing_map)
@@ -333,6 +351,10 @@ class GatewayEngine(QThread):
         self._write_monitor_task = asyncio.create_task(
             _ua_write_monitor(ua_server, ua_vars, handler, self._stop_event)
         )
+        # Start periodic async GC to clean up event loop internal references
+        self._async_gc_task = asyncio.create_task(
+            _async_gc_loop(self._stop_event)
+        )
         msg = "OPC UA Gateway is up and running on " + OPC_UA_ENDPOINT
         logger.info(msg)
         self.log_signal.emit(msg)
@@ -342,6 +364,8 @@ class GatewayEngine(QThread):
             while not self._stop_event.is_set():
                 await asyncio.sleep(0.5)
             self.log_signal.emit("Shutdown requested – stopping server...")
+            # Signal worker threads to stop by setting the stop event
+            self._stop_event.set()
             # Cancel the write monitor task
             if hasattr(self, '_write_monitor_task'):
                 self._write_monitor_task.cancel()
@@ -349,13 +373,38 @@ class GatewayEngine(QThread):
                     await self._write_monitor_task
                 except asyncio.CancelledError:
                     pass
+            # Cancel the async GC task
+            if hasattr(self, '_async_gc_task'):
+                self._async_gc_task.cancel()
+                try:
+                    await self._async_gc_task
+                except asyncio.CancelledError:
+                    pass
         self.log_signal.emit("OPC UA server stopped.")
+
+        # Join all worker threads with timeout
+        self.log_signal.emit(f"Joining {len(self._worker_threads)} worker threads...")
+        alive_count = 0
+        for i, t in enumerate(self._worker_threads):
+            if t.is_alive():
+                t.join(timeout=3.0)
+                if t.is_alive():
+                    alive_count += 1
+                    logger.warning(f"Worker thread '{t.name}' did not stop within timeout")
+                else:
+                    logger.info(f"Worker thread '{t.name}' joined successfully")
+        if alive_count == 0:
+            logger.info("All worker threads stopped cleanly")
+        else:
+            logger.warning(f"{alive_count} worker thread(s) still alive after timeout")
+        self._worker_threads.clear()
 
         # Clean up global state to prevent memory leaks
         for srv in self._server_names:
             write_queues.pop(srv, None)
         da_written_values.clear()
-        logger.debug("Gateway engine cleanup complete: write_queues and da_written_values cleared")
+        self._server_names.clear()
+        logger.debug("Gateway engine cleanup complete")
         log_memory_usage(logger, "gateway-stop")
 
 
@@ -407,26 +456,32 @@ def _da_write_ua_batch(write_list):
 
 
 async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event):
-    """Poll UA variables for externally-written values and route them to DA.
+    """Monitor UA variables for externally-written values and route them to DA.
 
-    asyncua 1.1.0 does not have set_data_value_callback on the address space,
-    so we periodically read each variable's value and compare it against the
-    last known value. Changes that match what the DA worker wrote are skipped
-    to avoid echo writes back to DA.
+    Instead of calling read_value() which creates DataValue/Variant wrappers,
+    we read the Variant directly from each node's internal storage via
+    read_value_variant() which is much lighter on object allocation.
     """
-    last_values = {}  # nodeid -> value
-    poll_interval = 0.5  # seconds (increased from 0.25 to reduce overhead)
+    # Ordered list of (nodeid, node) for stable iteration
+    node_list = [(node.nodeid, node) for _, node in ua_vars.items()]
+    all_nodeids = frozenset(nid for nid, _ in node_list)
+
+    last_values = {}  # nodeid -> raw python value
+    poll_interval = 1.0  # seconds - reduced frequency to cut object churn
     prune_interval = 30  # seconds between pruning
     last_prune = time.monotonic()
-    current_nodeids = frozenset(node.nodeid for node in ua_vars.values())
 
     while not stop_event.is_set():
         await asyncio.sleep(poll_interval)
         try:
-            for da_tag, node in ua_vars.items():
-                nodeid = node.nodeid
-                dv = await node.read_value()
-                current = dv.Value.Value if hasattr(dv, 'Value') else dv
+            for nodeid, node in node_list:
+                try:
+                    # read_value_variant() returns the raw Python value without
+                    # wrapping in DataValue, avoiding the allocation of wrapper objects
+                    current = await node.read_value_variant()
+                except Exception:
+                    continue
+
                 prev = last_values.get(nodeid)
                 if prev is None:
                     last_values[nodeid] = current
@@ -434,7 +489,7 @@ async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event):
                 # Skip if the change was made by the DA worker itself
                 da_entry = da_written_values.get(nodeid)
                 if da_entry is not None:
-                    da_val = da_entry[0]  # value is stored as (val, timestamp)
+                    da_val = da_entry[0]
                     if current == da_val:
                         last_values[nodeid] = current
                         continue
@@ -446,9 +501,8 @@ async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event):
             # Periodically prune stale entries
             now = time.monotonic()
             if now - last_prune > prune_interval:
-                _prune_da_written_values(current_nodeids)
-                # Also prune last_values for removed nodes
-                stale_last = [k for k in last_values if k not in current_nodeids]
+                _prune_da_written_values(all_nodeids)
+                stale_last = [k for k in last_values if k not in all_nodeids]
                 for k in stale_last:
                     del last_values[k]
                 last_prune = now
@@ -477,6 +531,32 @@ def _prune_da_written_values(current_nodeids):
         del da_written_values[k]
     if keys_to_remove:
         logger.debug(f"Pruned {len(keys_to_remove)} stale entries from da_written_values")
+
+
+async def _async_gc_loop(stop_event):
+    """Periodically run GC from within the async event loop.
+
+    The async event loop holds references to completed coroutine frames,
+    Future internals, and asyncua objects that synchronous GC can't easily
+    reach. Running GC from within the loop context helps release these.
+    """
+    interval = 60  # seconds
+    while not stop_event.is_set():
+        await asyncio.sleep(interval)
+        try:
+            mem_before = get_memory_usage_mb()
+            # Cancel done tasks to clear the loop's internal references
+            # Run 3 GC passes to break reference cycles
+            gc.collect()
+            gc.collect()
+            gc.collect()
+            mem_after = get_memory_usage_mb()
+            if mem_before is not None and mem_after is not None:
+                logger.info(f"Async GC: {mem_before:.1f} MB → {mem_after:.1f} MB (freed {mem_before - mem_after:.1f} MB)")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"Async GC error: {e}")
 
 
 def _interruptible_sleep(duration, stop_event=None):
@@ -817,11 +897,14 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                 # Submit all writes as a single batch (one Future instead of N)
                 if write_batch and async_loop:
                     future = _da_write_ua_batch(write_batch)
-                    # Wait for the batch to complete with a timeout to prevent queue buildup
+                    # Clear the batch list immediately so nodes aren't double-referenced
+                    write_batch.clear()
                     try:
                         future.result(timeout=2.0)
                     except Exception as e:
                         logger.warning(f"[{server_name}] batch write error: {e}")
+                    finally:
+                        del future  # Release Future reference explicitly
 
                 time.sleep(max(poll_interval / 10, 0.05))
             else:
@@ -836,10 +919,14 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                     # Submit batch (one Future per chunk instead of one per tag)
                     if write_batch and async_loop:
                         future = _da_write_ua_batch(write_batch)
+                        # Clear batch immediately after scheduling
+                        write_batch.clear()
                         try:
                             future.result(timeout=2.0)
                         except Exception as e:
                             logger.warning(f"[{server_name}] batch write error: {e}")
+                        finally:
+                            del future  # Release Future reference explicitly
 
                 _interruptible_sleep(poll_interval, stop_event)
         except Exception as e:
@@ -852,6 +939,13 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
     logger.info(f"[{server_name}] worker shutting down cleanly")
     log_memory_usage(logger, server_name)
     cleanup_connection()
+    
+    # Clear local references to help GC
+    del ua_variables
+    del chunks
+    del my_queue
+    
+    logger.info(f"[{server_name}] worker thread exiting")
 
 
 # ===================================================================
@@ -1436,7 +1530,13 @@ class MainWindow(QMainWindow):
             self._log(f"Force GC: collected {total_collected} objects (pass1:{collected} pass2:{collected_pass2} pass3:{collected_pass3})")
             self._log(f"  Memory: {mem_before:.1f} MB → {mem_after:.1f} MB (freed {mem_before - mem_after:.1f} MB)")
             
-            # Show object count changes
+            # Show thread status
+            threads = threading.enumerate()
+            self._log(f"  Active threads: {len(threads)}")
+            for t in threads:
+                self._log(f"    - {t.name} (daemon={t.daemon}, alive={t.is_alive()})")
+            
+            # Show object count changes for key types
             self._log(f"  Object counts (before → after [delta]):")
             for ttype in sorted(type_counts_before.keys()):
                 before = type_counts_before[ttype]
@@ -1682,17 +1782,41 @@ class MainWindow(QMainWindow):
 
     def _stop_gateway(self):
         if self.engine:
+            self._log("Stopping gateway...")
+            # Disconnect signals first to prevent emissions during shutdown
+            try:
+                self.engine.log_signal.disconnect(self._log)
+            except TypeError:
+                pass
+            try:
+                self.engine.server_status_signal.disconnect(self._on_server_status_changed)
+            except TypeError:
+                pass
+            
+            # Signal stop and wait
             self.engine._stop_event.set()
             self.engine.wait(5000)
             if self.engine.isRunning():
+                self._log("Gateway didn't stop in time, terminating...")
                 self.engine.terminate()
                 self.engine.wait(3000)
+            
+            # Clean up engine reference
             self.engine.deleteLater()
             self.engine = None
+            
+            # Force GC to clean up thread resources
+            collected = gc.collect()
+            mem = get_memory_usage_mb()
+            if mem is not None:
+                self._log(f"Gateway stopped. GC freed {collected} objects, memory: {mem:.1f} MB")
+            else:
+                self._log(f"Gateway stopped. GC freed {collected} objects")
+        
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
-        self._log("Gateway stopped.")
         self.statusBar().showMessage("Gateway stopped")
+        self._update_memory_status()
 
     @Slot()
     def _clear_log(self):
