@@ -351,19 +351,12 @@ class GatewayEngine(QThread):
         # Log memory usage after setup
         log_memory_usage(logger, "gateway-start")
 
-        # DIAGNOSTIC: Set SKIP_WRITE_MONITOR=true to skip the write monitor task
-        import os
-        skip_write_monitor = os.environ.get('SKIP_WRITE_MONITOR', 'false').lower() == 'true'
-
-        if not skip_write_monitor:
-            # Start a background monitor for UA write requests (asyncua 1.1.0 lacks
-            # set_data_value_callback, so we poll the variables for external writes)
-            self._write_monitor_task = asyncio.create_task(
-                _ua_write_monitor(ua_server, ua_vars, handler, self._stop_event, self._client_count)
-            )
-            logger.info("Write monitor task created")
-        else:
-            logger.info("[DIAG] Write monitor task skipped (SKIP_WRITE_MONITOR=true)")
+        # Start a background monitor for UA write requests (asyncua lacks
+        # set_data_value_callback, so we poll the variables for external writes)
+        self._write_monitor_task = asyncio.create_task(
+            _ua_write_monitor(ua_server, ua_vars, handler, self._stop_event, self._client_count)
+        )
+        logger.info("Write monitor task created")
 
         # Start periodic async GC to clean up event loop internal references
         self._async_gc_task = asyncio.create_task(
@@ -463,37 +456,13 @@ async def _da_write_ua(node, val):
 
 
 async def _da_write_ua_batch_impl(ua_server, write_list):
-    """Execute a batch of writes inside the async loop (single Future).
-
-    Strategy: directly mutate the AttributeValue.value in the address space
-    node, bypassing asyncua's session-based write stack (write_value →
-    write_attribute → session.write) which creates WriteValue/WriteParameters/
-    Response objects that allocate native C memory in open62541.
-    """
-    address_space = ua_server.iserver.aspace
-
+    """Execute a batch of writes inside the async loop (single Future)."""
     for node, val in write_list:
         nid = node.nodeid
         try:
-            ua_node = address_space.get(nid)
-            if ua_node is not None:
-                # Direct mutation of the attribute value storage
-                variant = ua.Variant(val, nid.type if hasattr(nid, 'type') else ua.VariantType.Double)
-                data_value = ua.DataValue(variant)
-
-                attval = ua_node.attributes.get(ua.AttributeIds.Value)
-                if attval is not None:
-                    attval.value = data_value
-                else:
-                    await node.write_value(val)
-            else:
-                await node.write_value(val)
+            await node.write_value(val)
         except Exception as e:
             logger.debug(f"Batch write error for {nid}: {e}")
-            try:
-                await node.write_value(val)
-            except Exception:
-                pass
         da_written_values[nid] = (val, time.monotonic())
 
 
@@ -600,9 +569,7 @@ async def _async_gc_loop(stop_event):
     Future internals, and asyncua objects that synchronous GC can't easily
     reach. Running GC from within the loop context helps release these.
     """
-    interval = 30  # seconds (more frequent for aggressive leak mitigation)
-    loop = asyncio.get_event_loop()
-    diag_count = 0
+    interval = 30  # seconds
     logger.info("Async GC loop started (interval=%ds)" % interval)
     while not stop_event.is_set():
         await asyncio.sleep(interval)
@@ -614,18 +581,11 @@ async def _async_gc_loop(stop_event):
             n3 = gc.collect()
             total = n1 + n2 + n3
             mem_after = get_memory_usage_mb()
-            diag_count += 1
-
-            # DIAGNOSTIC: Check event loop internals for accumulated tasks/futures
-            ready_q = len(loop._ready) if hasattr(loop, '_ready') else 'N/A'
-            scheduled_q = len(loop._scheduled) if hasattr(loop, '_scheduled') else 'N/A'
-            timer_q = len(loop._timers) if hasattr(loop, '_timers') else 'N/A'
-
             if mem_before is not None and mem_after is not None:
                 freed = mem_before - mem_after
                 tag = "+%.1f" % freed if freed > 0 else "%.1f" % freed
-                logger.info("Async GC #%d: %.1f MB -> %.1f MB (%s MB), collected %d objects | loop: ready=%s, scheduled=%s, timers=%s" % (
-                    diag_count, mem_before, mem_after, tag, total, ready_q, scheduled_q, timer_q))
+                logger.info("Async GC: %.1f MB -> %.1f MB (%s MB), collected %d objects" % (
+                    mem_before, mem_after, tag, total))
             else:
                 logger.info("Async GC: collected %d objects (psutil unavailable)" % total)
         except asyncio.CancelledError:
@@ -838,12 +798,6 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
     gc_interval = 60  # seconds between GC runs
     last_gc_time = time.monotonic()
     
-    # Memory leak diagnostic: track memory growth per cycle
-    leak_check_interval = 30  # seconds between leak checks
-    last_leak_check = time.monotonic()
-    last_leak_mem = get_memory_usage_mb()
-    leak_cycle_count = 0
-    
     # Log initial memory usage
     log_memory_usage(logger, server_name)
 
@@ -900,18 +854,10 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
             gc.collect()
             mem_after = get_memory_usage_mb()
             if mem_before is not None and mem_after is not None:
-                logger.info(f"[{server_name}] GC: {mem_before:.1f} MB → {mem_after:.1f} MB (freed {mem_before - mem_after:.1f} MB)")
+                freed = mem_before - mem_after
+                if freed > 0.5:  # only log if meaningful amount freed
+                    logger.info(f"[{server_name}] GC: {mem_before:.1f} MB → {mem_after:.1f} MB (freed {freed:.1f} MB)")
             last_gc_time = now
-        
-        # Memory leak diagnostic: track growth rate
-        if now - last_leak_check > leak_check_interval:
-            current_mem = get_memory_usage_mb()
-            if current_mem is not None and last_leak_mem is not None:
-                growth = current_mem - last_leak_mem
-                leak_cycle_count += 1
-                logger.info(f"[{server_name}] Leak check #{leak_cycle_count}: {last_leak_mem:.1f} → {current_mem:.1f} MB (growth: {growth:+.1f} MB in {leak_check_interval}s, rate: {growth/leak_check_interval*3600:.1f} MB/hr)")
-            last_leak_mem = current_mem
-            last_leak_check = now
 
         # Check if it's time for periodic reinitialization
         if reinit_interval > 0 and last_reinit_time is not None and connected:
@@ -971,41 +917,22 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                     raise
                 my_queue.task_done()
 
-            # DIAGNOSTIC: Set env vars to isolate leak source
-            # SKIP_UA_WRITES=true  : skip UA writes (tests DA read path)
-            # SKIP_DA_READS=true   : skip DA reads (tests asyncua server alone)
-            import os
-            skip_ua_writes = os.environ.get('SKIP_UA_WRITES', 'false').lower() == 'true'
-            skip_da_reads = os.environ.get('SKIP_DA_READS', 'false').lower() == 'true'
-
-            if skip_da_reads:
-                # Just sleep to simulate polling without any COM or UA activity
-                time.sleep(poll_interval)
-                continue
-
             if da_mode == "subscription" and subscribed:
                 # Subscription mode – read returns only changed values
                 write_batch = []
-                raw_results = None
                 try:
-                    raw_results = da_client.read(tags)
-                    for tname, val, qual, ts in raw_results:
+                    for tname, val, qual, ts in da_client.read(tags):
                         if qual == "Good":
                             node = ua_variables[tname]
                             write_batch.append((node, val))
                         elif qual != "Good":
                             logger.debug(f"[{server_name}] tag {tname} quality: {qual}")
-                        # Explicitly release COM references from the tuple
                         del tname, val, qual, ts
                 except Exception as e:
                     raise
-                finally:
-                    # Release COM result list references immediately
-                    del raw_results
-                    raw_results = None
 
                 # Submit all writes as a single batch
-                if write_batch and async_loop and not skip_ua_writes:
+                if write_batch and async_loop:
                     future = _da_write_ua_batch(write_batch)
                     write_batch.clear()
                     try:
@@ -1014,31 +941,20 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                         logger.warning(f"[{server_name}] batch write error: {e}")
                     finally:
                         del future
-                elif write_batch and skip_ua_writes:
-                    logger.debug(f"[{server_name}] [DIAG] skipped UA write of {len(write_batch)} tags")
-                    write_batch.clear()
 
                 time.sleep(max(poll_interval / 10, 0.05))
             else:
                 # Polling mode – read all tags in chunks and batch writes
                 for chunk in chunks:
                     write_batch = []
-                    raw_results = None
-                    try:
-                        raw_results = da_client.read(chunk)
-                        for tname, val, qual, ts in raw_results:
-                            if qual == "Good":
-                                node = ua_variables[tname]
-                                write_batch.append((node, val))
-                            # Explicitly release COM references
-                            del tname, val, qual, ts
-                    finally:
-                        # Release COM result list references immediately
-                        del raw_results
-                        raw_results = None
+                    for tname, val, qual, ts in da_client.read(chunk):
+                        if qual == "Good":
+                            node = ua_variables[tname]
+                            write_batch.append((node, val))
+                        del tname, val, qual, ts
 
                     # Submit batch
-                    if write_batch and async_loop and not skip_ua_writes:
+                    if write_batch and async_loop:
                         future = _da_write_ua_batch(write_batch)
                         write_batch.clear()
                         try:
@@ -1047,9 +963,6 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                             logger.warning(f"[{server_name}] batch write error: {e}")
                         finally:
                             del future
-                    elif write_batch and skip_ua_writes:
-                        logger.debug(f"[{server_name}] [DIAG] skipped UA write of {len(write_batch)} tags")
-                        write_batch.clear()
 
                 _interruptible_sleep(poll_interval, stop_event)
         except Exception as e:
