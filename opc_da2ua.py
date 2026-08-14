@@ -264,6 +264,7 @@ class GatewayEngine(QThread):
             self._async_loop = None
 
     async def _async_main(self):
+        global ua_server_global
         if not self.config:
             self.log_signal.emit("No servers configured – add servers to start.")
             return
@@ -411,7 +412,7 @@ class GatewayEngine(QThread):
             write_queues.pop(srv, None)
         da_written_values.clear()
         self._server_names.clear()
-        global ua_server_global
+        
         ua_server_global = None
         logger.debug("Gateway engine cleanup complete")
         log_memory_usage(logger, "gateway-stop")
