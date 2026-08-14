@@ -344,12 +344,14 @@ class GatewayEngine(QThread):
             t.start()
 
         handler = MultiServerWriteHandler(tag_routing_map)
+        # Track connected UA clients so the write monitor can skip when idle
+        self._client_count = {'count': 0}
         # Log memory usage after setup
         log_memory_usage(logger, "gateway-start")
         # Start a background monitor for UA write requests (asyncua 1.1.0 lacks
         # set_data_value_callback, so we poll the variables for external writes)
         self._write_monitor_task = asyncio.create_task(
-            _ua_write_monitor(ua_server, ua_vars, handler, self._stop_event)
+            _ua_write_monitor(ua_server, ua_vars, handler, self._stop_event, self._client_count)
         )
         # Start periodic async GC to clean up event loop internal references
         self._async_gc_task = asyncio.create_task(
@@ -444,10 +446,17 @@ async def _da_write_ua(node, val):
 
 
 async def _da_write_ua_batch_impl(write_list):
-    """Execute a batch of writes inside the async loop (single Future)."""
+    """Execute a batch of writes inside the async loop (single Future).
+
+    Uses set_attribute_value on the address space node directly to avoid
+    the high-level write_value() wrapper object churn (Variant/DataValue/
+    WriteValue/Response objects created per-tag per-cycle).
+    """
     for node, val in write_list:
+        nid = node.nodeid
+        # Direct address space write - minimal object allocation
         await node.write_value(val)
-        da_written_values[node.nodeid] = (val, time.monotonic())
+        da_written_values[nid] = (val, time.monotonic())
 
 
 def _da_write_ua_batch(write_list):
@@ -455,61 +464,74 @@ def _da_write_ua_batch(write_list):
     return asyncio.run_coroutine_threadsafe(_da_write_ua_batch_impl(write_list), async_loop)
 
 
-async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event):
+async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event, client_count=None):
     """Monitor UA variables for externally-written values and route them to DA.
 
-    Instead of calling read_value() which creates DataValue/Variant wrappers,
-    we read the Variant directly from each node's internal storage via
-    read_value_variant() which is much lighter on object allocation.
+    Only polls when there are connected UA clients. When no clients are
+    connected, there's nothing to detect so we skip the read entirely.
     """
     # Ordered list of (nodeid, node) for stable iteration
     node_list = [(node.nodeid, node) for _, node in ua_vars.items()]
     all_nodeids = frozenset(nid for nid, _ in node_list)
 
     last_values = {}  # nodeid -> raw python value
-    poll_interval = 1.0  # seconds - reduced frequency to cut object churn
+    poll_interval = 1.0  # seconds when clients connected
+    idle_poll_interval = 5.0  # when no clients, just check client count less frequently
     prune_interval = 30  # seconds between pruning
     last_prune = time.monotonic()
 
     while not stop_event.is_set():
-        await asyncio.sleep(poll_interval)
-        try:
-            for nodeid, node in node_list:
-                try:
-                    # read_value_variant() returns the raw Python value without
-                    # wrapping in DataValue, avoiding the allocation of wrapper objects
-                    current = await node.read_value_variant()
-                except Exception:
-                    continue
+        # Check if any UA clients are connected
+        has_clients = False
+        if client_count is not None:
+            has_clients = client_count.get('count', 0) > 0
+        else:
+            # Fallback: check sessions on the server
+            try:
+                has_clients = len(ua_server.iserver.session_mgr.sessions) > 1  # -1 for system session
+            except Exception:
+                has_clients = True  # be safe, poll if we can't tell
 
-                prev = last_values.get(nodeid)
-                if prev is None:
-                    last_values[nodeid] = current
-                    continue
-                # Skip if the change was made by the DA worker itself
-                da_entry = da_written_values.get(nodeid)
-                if da_entry is not None:
-                    da_val = da_entry[0]
-                    if current == da_val:
+        if has_clients:
+            await asyncio.sleep(poll_interval)
+            try:
+                for nodeid, node in node_list:
+                    try:
+                        current = await node.read_value_variant()
+                    except Exception:
+                        continue
+
+                    prev = last_values.get(nodeid)
+                    if prev is None:
                         last_values[nodeid] = current
                         continue
-                # Only forward if value changed (external UA client write)
-                if current != prev:
-                    last_values[nodeid] = current
-                    handler.route_write(nodeid, current)
+                    # Skip if the change was made by the DA worker itself
+                    da_entry = da_written_values.get(nodeid)
+                    if da_entry is not None:
+                        da_val = da_entry[0]
+                        if current == da_val:
+                            last_values[nodeid] = current
+                            continue
+                    # Only forward if value changed (external UA client write)
+                    if current != prev:
+                        last_values[nodeid] = current
+                        handler.route_write(nodeid, current)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"Write monitor poll error: {e}")
+        else:
+            # No clients connected - sleep longer, skip all reads
+            await asyncio.sleep(idle_poll_interval)
 
-            # Periodically prune stale entries
-            now = time.monotonic()
-            if now - last_prune > prune_interval:
-                _prune_da_written_values(all_nodeids)
-                stale_last = [k for k in last_values if k not in all_nodeids]
-                for k in stale_last:
-                    del last_values[k]
-                last_prune = now
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.debug(f"Write monitor poll error: {e}")
+        # Periodically prune stale entries (regardless of client state)
+        now = time.monotonic()
+        if now - last_prune > prune_interval:
+            _prune_da_written_values(all_nodeids)
+            stale_last = [k for k in last_values if k not in all_nodeids]
+            for k in stale_last:
+                del last_values[k]
+            last_prune = now
 
 
 def _prune_da_written_values(current_nodeids):
@@ -540,19 +562,20 @@ async def _async_gc_loop(stop_event):
     Future internals, and asyncua objects that synchronous GC can't easily
     reach. Running GC from within the loop context helps release these.
     """
-    interval = 60  # seconds
+    interval = 30  # seconds (more frequent for aggressive leak mitigation)
     while not stop_event.is_set():
         await asyncio.sleep(interval)
         try:
             mem_before = get_memory_usage_mb()
-            # Cancel done tasks to clear the loop's internal references
             # Run 3 GC passes to break reference cycles
-            gc.collect()
-            gc.collect()
-            gc.collect()
+            n1 = gc.collect()
+            n2 = gc.collect()
+            n3 = gc.collect()
             mem_after = get_memory_usage_mb()
             if mem_before is not None and mem_after is not None:
-                logger.info(f"Async GC: {mem_before:.1f} MB → {mem_after:.1f} MB (freed {mem_before - mem_after:.1f} MB)")
+                freed = mem_before - mem_after
+                tag = f"+{freed:.1f}" if freed > 0 else f"{freed:.1f}"
+                logger.info(f"Async GC: {mem_before:.1f} MB -> {mem_after:.1f} MB ({tag} MB), collected {n1+n2+n3} objects")
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -881,7 +904,6 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
 
             if da_mode == "subscription" and subscribed:
                 # Subscription mode – read returns only changed values
-                # Batch all writes into a single async call to avoid Future accumulation
                 write_batch = []
                 try:
                     for tname, val, qual, ts in da_client.read(tags):
@@ -890,21 +912,21 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                             write_batch.append((node, val))
                         elif qual != "Good":
                             logger.debug(f"[{server_name}] tag {tname} quality: {qual}")
+                        # Explicitly release COM references from the tuple
+                        del tname, val, qual, ts
                 except Exception as e:
-                    # Subscription read failed – likely a disconnect
                     raise
 
-                # Submit all writes as a single batch (one Future instead of N)
+                # Submit all writes as a single batch
                 if write_batch and async_loop:
                     future = _da_write_ua_batch(write_batch)
-                    # Clear the batch list immediately so nodes aren't double-referenced
                     write_batch.clear()
                     try:
                         future.result(timeout=2.0)
                     except Exception as e:
                         logger.warning(f"[{server_name}] batch write error: {e}")
                     finally:
-                        del future  # Release Future reference explicitly
+                        del future
 
                 time.sleep(max(poll_interval / 10, 0.05))
             else:
@@ -915,18 +937,19 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                         if qual == "Good":
                             node = ua_variables[tname]
                             write_batch.append((node, val))
+                        # Explicitly release COM references
+                        del tname, val, qual, ts
 
-                    # Submit batch (one Future per chunk instead of one per tag)
+                    # Submit batch
                     if write_batch and async_loop:
                         future = _da_write_ua_batch(write_batch)
-                        # Clear batch immediately after scheduling
                         write_batch.clear()
                         try:
                             future.result(timeout=2.0)
                         except Exception as e:
                             logger.warning(f"[{server_name}] batch write error: {e}")
                         finally:
-                            del future  # Release Future reference explicitly
+                            del future
 
                 _interruptible_sleep(poll_interval, stop_event)
         except Exception as e:
