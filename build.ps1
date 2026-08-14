@@ -97,6 +97,9 @@ Write-Host "[3/4] Installing dependencies (this may take a few minutes)..." -For
 # Upgrade pip first
 & $PYTHON_EXE -m pip install --upgrade pip setuptools wheel --quiet
 
+# Install psutil from binary wheel (avoids building from source)
+& $PYTHON_EXE -m pip install psutil --only-binary :all: --quiet
+
 # Install requirements
 & $PYTHON_EXE -m pip install -r requirements.txt --quiet
 
