@@ -447,28 +447,40 @@ async def _da_write_ua(node, val):
     da_written_values[node.nodeid] = (val, time.monotonic())
 
 
-async def _da_write_ua_batch_impl(write_list):
+async def _da_write_ua_batch_impl(ua_server, write_list):
     """Execute a batch of writes inside the async loop (single Future).
 
-    Writes directly to the address space via set_attribute_value to avoid
-    asyncua's high-level write_value() which creates native memory in
-    open62541 that Python's GC cannot free (Variant/DataValue/WriteValue/
-    Response objects per call).
+    Writes directly to the address space node's Value attribute via
+    set_attribute_value, bypassing asyncua's high-level write_value() which
+    allocates native C memory in open62541 per call (Variant/DataValue/
+    WriteValue/Response objects that Python's GC cannot free).
     """
+    address_space = ua_server.iserver.address_space
     for node, val in write_list:
         nid = node.nodeid
-        # Direct write to address space - bypasses high-level asyncua stack
-        # that allocates native C memory per call
         try:
-            await node.write_value(val)
+            ua_node = address_space.get(nid)
+            if ua_node is not None:
+                # Direct write to the node's ValueDataChange attribute
+                # This avoids the high-level write_value() stack
+                variant = ua.Variant(val, nid.type if hasattr(nid, 'type') else ua.VariantType.Double)
+                data_value = ua.DataValue(variant)
+                await ua_node.set_attribute_value(ua.AttributeIds.Value, data_value)
+            else:
+                # Fallback to high-level write if direct access fails
+                await node.write_value(val)
         except Exception as e:
             logger.debug(f"Batch write error for {nid}: {e}")
+            try:
+                await node.write_value(val)
+            except Exception:
+                pass
         da_written_values[nid] = (val, time.monotonic())
 
 
 def _da_write_ua_batch(write_list):
     """Schedule a batch of UA writes on the async loop as a single Future."""
-    return asyncio.run_coroutine_threadsafe(_da_write_ua_batch_impl(write_list), async_loop)
+    return asyncio.run_coroutine_threadsafe(_da_write_ua_batch_impl(async_loop, write_list), async_loop)
 
 
 async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event, client_count=None):
