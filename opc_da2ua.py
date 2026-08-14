@@ -461,13 +461,14 @@ async def _da_write_ua_batch_impl(ua_server, write_list):
     allocates native C memory in open62541 per call (Variant/DataValue/
     WriteValue/Response objects that Python's GC cannot free).
     """
-    address_space = ua_server.iserver.address_space
+    # In asyncua 1.1.0, address space is on the nodes manager
+    address_space = ua_server.iserver.nodes_mgr.address_space
     for node, val in write_list:
         nid = node.nodeid
         try:
             ua_node = address_space.get(nid)
             if ua_node is not None:
-                # Direct write to the node's ValueDataChange attribute
+                # Direct write to the node's Value attribute
                 # This avoids the high-level write_value() stack
                 variant = ua.Variant(val, nid.type if hasattr(nid, 'type') else ua.VariantType.Double)
                 data_value = ua.DataValue(variant)
