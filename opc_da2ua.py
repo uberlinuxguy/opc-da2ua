@@ -456,25 +456,28 @@ async def _da_write_ua(node, val):
 async def _da_write_ua_batch_impl(ua_server, write_list):
     """Execute a batch of writes inside the async loop (single Future).
 
-    Writes directly to the address space node's Value attribute via
-    set_attribute_value, bypassing asyncua's high-level write_value() which
-    allocates native C memory in open62541 per call (Variant/DataValue/
-    WriteValue/Response objects that Python's GC cannot free).
+    Strategy: directly mutate the AttributeValue.value in the address space
+    node, bypassing asyncua's session-based write stack (write_value →
+    write_attribute → session.write) which creates WriteValue/WriteParameters/
+    Response objects that allocate native C memory in open62541.
     """
-    # In asyncua 1.1.0, address space is ua_server.iserver.aspace
     address_space = ua_server.iserver.aspace
+
     for node, val in write_list:
         nid = node.nodeid
         try:
             ua_node = address_space.get(nid)
             if ua_node is not None:
-                # Direct write to the node's Value attribute
-                # This avoids the high-level write_value() stack
+                # Direct mutation of the attribute value storage
                 variant = ua.Variant(val, nid.type if hasattr(nid, 'type') else ua.VariantType.Double)
                 data_value = ua.DataValue(variant)
-                await ua_node.set_attribute_value(ua.AttributeIds.Value, data_value)
+
+                attval = ua_node.attributes.get(ua.AttributeIds.Value)
+                if attval is not None:
+                    attval.value = data_value
+                else:
+                    await node.write_value(val)
             else:
-                # Fallback to high-level write if direct access fails
                 await node.write_value(val)
         except Exception as e:
             logger.debug(f"Batch write error for {nid}: {e}")
@@ -589,6 +592,8 @@ async def _async_gc_loop(stop_event):
     reach. Running GC from within the loop context helps release these.
     """
     interval = 30  # seconds (more frequent for aggressive leak mitigation)
+    loop = asyncio.get_event_loop()
+    diag_count = 0
     logger.info("Async GC loop started (interval=%ds)" % interval)
     while not stop_event.is_set():
         await asyncio.sleep(interval)
@@ -600,11 +605,18 @@ async def _async_gc_loop(stop_event):
             n3 = gc.collect()
             total = n1 + n2 + n3
             mem_after = get_memory_usage_mb()
+            diag_count += 1
+
+            # DIAGNOSTIC: Check event loop internals for accumulated tasks/futures
+            ready_q = len(loop._ready) if hasattr(loop, '_ready') else 'N/A'
+            scheduled_q = len(loop._scheduled) if hasattr(loop, '_scheduled') else 'N/A'
+            timer_q = len(loop._timers) if hasattr(loop, '_timers') else 'N/A'
+
             if mem_before is not None and mem_after is not None:
                 freed = mem_before - mem_after
                 tag = "+%.1f" % freed if freed > 0 else "%.1f" % freed
-                logger.info("Async GC: %.1f MB -> %.1f MB (%s MB), collected %d objects" % (
-                    mem_before, mem_after, tag, total))
+                logger.info("Async GC #%d: %.1f MB -> %.1f MB (%s MB), collected %d objects | loop: ready=%s, scheduled=%s, timers=%s" % (
+                    diag_count, mem_before, mem_after, tag, total, ready_q, scheduled_q, timer_q))
             else:
                 logger.info("Async GC: collected %d objects (psutil unavailable)" % total)
         except asyncio.CancelledError:
@@ -950,6 +962,11 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                     raise
                 my_queue.task_done()
 
+            # DIAGNOSTIC: Set SKIP_UA_WRITES=True in preferences or env to skip
+            # all UA writes and isolate whether the leak is in DA read or UA write path
+            import os
+            skip_ua_writes = os.environ.get('SKIP_UA_WRITES', 'false').lower() == 'true'
+
             if da_mode == "subscription" and subscribed:
                 # Subscription mode – read returns only changed values
                 write_batch = []
@@ -966,7 +983,7 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                     raise
 
                 # Submit all writes as a single batch
-                if write_batch and async_loop:
+                if write_batch and async_loop and not skip_ua_writes:
                     future = _da_write_ua_batch(write_batch)
                     write_batch.clear()
                     try:
@@ -975,6 +992,9 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                         logger.warning(f"[{server_name}] batch write error: {e}")
                     finally:
                         del future
+                elif write_batch and skip_ua_writes:
+                    logger.debug(f"[{server_name}] [DIAG] skipped UA write of {len(write_batch)} tags")
+                    write_batch.clear()
 
                 time.sleep(max(poll_interval / 10, 0.05))
             else:
@@ -989,7 +1009,7 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                         del tname, val, qual, ts
 
                     # Submit batch
-                    if write_batch and async_loop:
+                    if write_batch and async_loop and not skip_ua_writes:
                         future = _da_write_ua_batch(write_batch)
                         write_batch.clear()
                         try:
@@ -998,6 +1018,9 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                             logger.warning(f"[{server_name}] batch write error: {e}")
                         finally:
                             del future
+                    elif write_batch and skip_ua_writes:
+                        logger.debug(f"[{server_name}] [DIAG] skipped UA write of {len(write_batch)} tags")
+                        write_batch.clear()
 
                 _interruptible_sleep(poll_interval, stop_event)
         except Exception as e:
