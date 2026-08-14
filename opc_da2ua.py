@@ -962,16 +962,25 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                     raise
                 my_queue.task_done()
 
-            # DIAGNOSTIC: Set SKIP_UA_WRITES=True in preferences or env to skip
-            # all UA writes and isolate whether the leak is in DA read or UA write path
+            # DIAGNOSTIC: Set env vars to isolate leak source
+            # SKIP_UA_WRITES=true  : skip UA writes (tests DA read path)
+            # SKIP_DA_READS=true   : skip DA reads (tests asyncua server alone)
             import os
             skip_ua_writes = os.environ.get('SKIP_UA_WRITES', 'false').lower() == 'true'
+            skip_da_reads = os.environ.get('SKIP_DA_READS', 'false').lower() == 'true'
+
+            if skip_da_reads:
+                # Just sleep to simulate polling without any COM or UA activity
+                time.sleep(poll_interval)
+                continue
 
             if da_mode == "subscription" and subscribed:
                 # Subscription mode – read returns only changed values
                 write_batch = []
+                raw_results = None
                 try:
-                    for tname, val, qual, ts in da_client.read(tags):
+                    raw_results = da_client.read(tags)
+                    for tname, val, qual, ts in raw_results:
                         if qual == "Good":
                             node = ua_variables[tname]
                             write_batch.append((node, val))
@@ -981,6 +990,10 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                         del tname, val, qual, ts
                 except Exception as e:
                     raise
+                finally:
+                    # Release COM result list references immediately
+                    del raw_results
+                    raw_results = None
 
                 # Submit all writes as a single batch
                 if write_batch and async_loop and not skip_ua_writes:
@@ -1001,12 +1014,19 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                 # Polling mode – read all tags in chunks and batch writes
                 for chunk in chunks:
                     write_batch = []
-                    for tname, val, qual, ts in da_client.read(chunk):
-                        if qual == "Good":
-                            node = ua_variables[tname]
-                            write_batch.append((node, val))
-                        # Explicitly release COM references
-                        del tname, val, qual, ts
+                    raw_results = None
+                    try:
+                        raw_results = da_client.read(chunk)
+                        for tname, val, qual, ts in raw_results:
+                            if qual == "Good":
+                                node = ua_variables[tname]
+                                write_batch.append((node, val))
+                            # Explicitly release COM references
+                            del tname, val, qual, ts
+                    finally:
+                        # Release COM result list references immediately
+                        del raw_results
+                        raw_results = None
 
                     # Submit batch
                     if write_batch and async_loop and not skip_ua_writes:
