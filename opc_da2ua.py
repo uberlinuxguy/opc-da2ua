@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# Nuitka: add Qt DLL directories to search path before importing PySide2
+# Nuitka: add Qt DLL directories to search path before importing PyQt5
 # ---------------------------------------------------------------------------
 import ctypes
 import os
@@ -8,26 +8,26 @@ import sys
 if getattr(sys, 'frozen', False):
     # Running as Nuitka compiled binary
     _base_path = os.path.dirname(os.path.abspath(sys.argv[0]))
-    _pyside2_dir = os.path.join(_base_path, 'PySide2')
-    _shiboken2_dir = os.path.join(_base_path, 'shiboken2')
+    _pyqt5_dir = os.path.join(_base_path, 'PyQt5')
+    _qt_dir = os.path.join(_base_path, 'Qt')
 
     # Add to PATH
     _extra_paths = []
-    if os.path.isdir(_pyside2_dir):
-        _extra_paths.append(_pyside2_dir)
-    if os.path.isdir(_shiboken2_dir):
-        _extra_paths.append(_shiboken2_dir)
+    if os.path.isdir(_pyqt5_dir):
+        _extra_paths.append(_pyqt5_dir)
+    if os.path.isdir(_qt_dir):
+        _extra_paths.append(_qt_dir)
     if _extra_paths:
         os.environ['PATH'] = os.pathsep.join(_extra_paths) + os.pathsep + os.environ.get('PATH', '')
 
     # Use SetDllDirectory as a fallback (Windows API)
     try:
-        ctypes.windll.kernel32.SetDllDirectoryW(_pyside2_dir)
+        ctypes.windll.kernel32.SetDllDirectoryW(_qt_dir)
     except AttributeError:
         pass
 
     # Qt plugin path
-    _plugins_dir = os.path.join(_pyside2_dir, 'plugins')
+    _plugins_dir = os.path.join(_qt_dir, 'plugins')
     if os.path.isdir(_plugins_dir):
         os.environ['QT_PLUGIN_PATH'] = _plugins_dir
         os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = os.path.join(_plugins_dir, 'platforms')
@@ -55,7 +55,7 @@ except ImportError:
 import OpenOPC
 import pythoncom
 from asyncua.server.server import Server, ua
-from PySide2.QtWidgets import (
+from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTreeWidget, QTreeWidgetItem, QHeaderView, QPushButton, QLabel,
     QFileDialog, QMessageBox, QDialog, QFormLayout, QLineEdit,
@@ -63,8 +63,8 @@ from PySide2.QtWidgets import (
     QMenuBar, QMenu, QComboBox, QAbstractItemView, QInputDialog,
     QAction, QRadioButton, QCheckBox,
 )
-from PySide2.QtCore import Qt, Slot, QThread, QTimer, Signal
-from PySide2.QtGui import QFont, QColor, QTextCursor
+from PyQt5.QtCore import Qt, pyqtSlot as Slot, QThread, QTimer, pyqtSignal as Signal
+from PyQt5.QtGui import QFont, QColor, QTextCursor
 
 # ---------------------------------------------------------------------------
 # Custom logging – routes to file + Qt log pane
@@ -350,12 +350,21 @@ class GatewayEngine(QThread):
         self._client_count = {'count': 0}
         # Log memory usage after setup
         log_memory_usage(logger, "gateway-start")
-        # Start a background monitor for UA write requests (asyncua 1.1.0 lacks
-        # set_data_value_callback, so we poll the variables for external writes)
-        self._write_monitor_task = asyncio.create_task(
-            _ua_write_monitor(ua_server, ua_vars, handler, self._stop_event, self._client_count)
-        )
-        logger.info("Write monitor task created")
+
+        # DIAGNOSTIC: Set SKIP_WRITE_MONITOR=true to skip the write monitor task
+        import os
+        skip_write_monitor = os.environ.get('SKIP_WRITE_MONITOR', 'false').lower() == 'true'
+
+        if not skip_write_monitor:
+            # Start a background monitor for UA write requests (asyncua 1.1.0 lacks
+            # set_data_value_callback, so we poll the variables for external writes)
+            self._write_monitor_task = asyncio.create_task(
+                _ua_write_monitor(ua_server, ua_vars, handler, self._stop_event, self._client_count)
+            )
+            logger.info("Write monitor task created")
+        else:
+            logger.info("[DIAG] Write monitor task skipped (SKIP_WRITE_MONITOR=true)")
+
         # Start periodic async GC to clean up event loop internal references
         self._async_gc_task = asyncio.create_task(
             _async_gc_loop(self._stop_event)

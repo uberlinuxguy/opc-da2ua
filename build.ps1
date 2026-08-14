@@ -1,5 +1,5 @@
-# Build script for OPC DA→UA Gateway (32-bit Python 3.8)
-# Uses Python 3.8-32 + PySide2 (Qt 5.15) + downgraded dependencies
+# Build script for OPC DA→UA Gateway (32-bit Python 3.12)
+# Uses Python 3.12-32 + PyQt5 (Qt 5.15) + asyncua 2.x + OpenOPC-DA
 # Creates a standalone Windows executable using Nuitka
 
 $ErrorActionPreference = "Stop"
@@ -19,42 +19,43 @@ Write-Host ""
 
 $VENV_DIR = "venv"
 $PYTHON_EXE = "$VENV_DIR\Scripts\python.exe"
-$NUITKA_VERSION = "1.8.0"  # Last version with good Python 3.8 support
+$NUITKA_VERSION = "2.7.0"  # Nuitka for Python 3.12 support
 
 # ------------------------------------------------------------------
-# Step 1: Install Python 3.8-32 if not present
+# Step 1: Install Python 3.12-32 if not present
 # ------------------------------------------------------------------
-Write-Host "[1/4] Checking for 32-bit Python 3.8..." -ForegroundColor Yellow
+Write-Host "[1/4] Checking for 32-bit Python 3.12..." -ForegroundColor Yellow
 
-# Only look for 32-bit Python 3.8 (required for OPC DA COM compatibility)
-$python38_paths = @(
-    "$env:LOCALAPPDATA\Programs\Python\Python38-32\python.exe",
-    "C:\Python38-32\python.exe",
-    "C:\Program Files (x86)\Python38-32\python.exe"
+# Only look for 32-bit Python 3.12 (required for OPC DA COM + asyncua 2.x)
+$python312_paths = @(
+    "$env:LOCALAPPDATA\Programs\Python\Python312-32\python.exe",
+    "C:\Python312-32\python.exe",
+    "C:\Program Files (x86)\Python312-32\python.exe"
 )
 
-$python38_exe = $null
-foreach ($p in $python38_paths) {
+$python312_exe = $null
+foreach ($p in $python312_paths) {
     if (Test-Path $p) {
-        $python38_exe = $p
+        $python312_exe = $p
         break
     }
 }
 
-if (-not $python38_exe) {
+if (-not $python312_exe) {
     Write-Host ""
-    Write-Host "ERROR: 32-bit Python 3.8 not found on this system." -ForegroundColor Red
+    Write-Host "ERROR: 32-bit Python 3.12 not found on this system." -ForegroundColor Red
     Write-Host ""
-    Write-Host "Please install 32-bit Python 3.8 from:" -ForegroundColor Yellow
-    Write-Host "  https://www.python.org/ftp/python/3.8.10/python-3.8.10.exe" -ForegroundColor Cyan
+    Write-Host "Please install 32-bit Python 3.12 from:" -ForegroundColor Yellow
+    Write-Host "  https://www.python.org/downloads/windows/" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "IMPORTANT: Select 'Install for all users' and check" -ForegroundColor Yellow
-    Write-Host "'Add Python 3.8 to PATH' during installation." -ForegroundColor Yellow
+    Write-Host "'Add Python 3.12 to PATH' during installation." -ForegroundColor Yellow
+    Write-Host "Make sure to select the 32-bit (x86) installer." -ForegroundColor Yellow
     Write-Host ""
     exit 1
 }
 
-Write-Host "  Found: $python38_exe" -ForegroundColor Green
+Write-Host "  Found: $python312_exe" -ForegroundColor Green
 
 # ------------------------------------------------------------------
 # Step 2: Create virtual environment
@@ -83,7 +84,7 @@ if ($Clean) {
 if (Test-Path $VENV_DIR) {
     Write-Host "  Reusing existing venv" -ForegroundColor Gray
 } else {
-    & $python38_exe -m venv $VENV_DIR
+    & $python312_exe -m venv $VENV_DIR
     Write-Host "  Created: $VENV_DIR" -ForegroundColor Green
 }
 
@@ -132,16 +133,16 @@ Write-Host ""
     --standalone `
     --output-dir=dist `
     --output-filename=opc_da2ua.exe `
-    --include-package=PySide2 `
+    --include-package=PyQt5 `
     --include-package=asyncua `
     --nofollow-import-to=asyncua.server.standard_address_space `
     --nofollow-import-to=asyncua.ua.uaprotocol_auto `
     --nofollow-import-to=asyncua.ua.object_ids `
-    --include-data-files="venv/lib/site-packages/asyncua/ua/uaprotocol_auto.py=asyncua/ua/uaprotocol_auto.py" `
-    --include-data-files="venv/lib/site-packages/asyncua/ua/object_ids.py=asyncua/ua/object_ids.py" `
-    --include-data-files="venv/lib/site-packages/asyncua/server/standard_address_space/__init__.py=asyncua/server/standard_address_space/__init__.py" `
-    --include-data-files="venv/lib/site-packages/asyncua/server/standard_address_space/standard_address_space.py=asyncua/server/standard_address_space/standard_address_space.py" `
-    --include-data-files="venv/lib/site-packages/asyncua/server/standard_address_space/standard_address_space_services.py=asyncua/server/standard_address_space/standard_address_space_services.py" `
+    --include-data-files="venv/Lib/site-packages/asyncua/ua/uaprotocol_auto.py=asyncua/ua/uaprotocol_auto.py" `
+    --include-data-files="venv/Lib/site-packages/asyncua/ua/object_ids.py=asyncua/ua/object_ids.py" `
+    --include-data-files="venv/Lib/site-packages/asyncua/server/standard_address_space/__init__.py=asyncua/server/standard_address_space/__init__.py" `
+    --include-data-files="venv/Lib/site-packages/asyncua/server/standard_address_space/standard_address_space.py=asyncua/server/standard_address_space/standard_address_space.py" `
+    --include-data-files="venv/Lib/site-packages/asyncua/server/standard_address_space/standard_address_space_services.py=asyncua/server/standard_address_space/standard_address_space_services.py" `
     --include-package=OpenOPC `
     --include-package=cryptography `
     --include-package=win32com `
@@ -149,7 +150,7 @@ Write-Host ""
     --include-module=pywintypes `
     --include-module=win32api `
     --include-module=win32con `
-    --enable-plugin=pyside2 `
+    --enable-plugin=pyqt5 `
     --show-scons `
     opc_da2ua.py
 
