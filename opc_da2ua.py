@@ -461,8 +461,8 @@ async def _da_write_ua_batch_impl(ua_server, write_list):
     allocates native C memory in open62541 per call (Variant/DataValue/
     WriteValue/Response objects that Python's GC cannot free).
     """
-    # In asyncua 1.1.0, address space is on the nodes manager
-    address_space = ua_server.iserver.nodes_mgr.address_space
+    # In asyncua 1.1.0, address space is ua_server.iserver.aspace
+    address_space = ua_server.iserver.aspace
     for node, val in write_list:
         nid = node.nodeid
         try:
