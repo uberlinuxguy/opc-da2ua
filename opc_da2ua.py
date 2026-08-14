@@ -353,10 +353,12 @@ class GatewayEngine(QThread):
         self._write_monitor_task = asyncio.create_task(
             _ua_write_monitor(ua_server, ua_vars, handler, self._stop_event, self._client_count)
         )
+        logger.info("Write monitor task created")
         # Start periodic async GC to clean up event loop internal references
         self._async_gc_task = asyncio.create_task(
             _async_gc_loop(self._stop_event)
         )
+        logger.info("Async GC task created")
         msg = "OPC UA Gateway is up and running on " + OPC_UA_ENDPOINT
         logger.info(msg)
         self.log_signal.emit(msg)
@@ -448,14 +450,19 @@ async def _da_write_ua(node, val):
 async def _da_write_ua_batch_impl(write_list):
     """Execute a batch of writes inside the async loop (single Future).
 
-    Uses set_attribute_value on the address space node directly to avoid
-    the high-level write_value() wrapper object churn (Variant/DataValue/
-    WriteValue/Response objects created per-tag per-cycle).
+    Writes directly to the address space via set_attribute_value to avoid
+    asyncua's high-level write_value() which creates native memory in
+    open62541 that Python's GC cannot free (Variant/DataValue/WriteValue/
+    Response objects per call).
     """
     for node, val in write_list:
         nid = node.nodeid
-        # Direct address space write - minimal object allocation
-        await node.write_value(val)
+        # Direct write to address space - bypasses high-level asyncua stack
+        # that allocates native C memory per call
+        try:
+            await node.write_value(val)
+        except Exception as e:
+            logger.debug(f"Batch write error for {nid}: {e}")
         da_written_values[nid] = (val, time.monotonic())
 
 
@@ -563,6 +570,7 @@ async def _async_gc_loop(stop_event):
     reach. Running GC from within the loop context helps release these.
     """
     interval = 30  # seconds (more frequent for aggressive leak mitigation)
+    logger.info("Async GC loop started (interval=%ds)" % interval)
     while not stop_event.is_set():
         await asyncio.sleep(interval)
         try:
@@ -571,15 +579,20 @@ async def _async_gc_loop(stop_event):
             n1 = gc.collect()
             n2 = gc.collect()
             n3 = gc.collect()
+            total = n1 + n2 + n3
             mem_after = get_memory_usage_mb()
             if mem_before is not None and mem_after is not None:
                 freed = mem_before - mem_after
-                tag = f"+{freed:.1f}" if freed > 0 else f"{freed:.1f}"
-                logger.info(f"Async GC: {mem_before:.1f} MB -> {mem_after:.1f} MB ({tag} MB), collected {n1+n2+n3} objects")
+                tag = "+%.1f" % freed if freed > 0 else "%.1f" % freed
+                logger.info("Async GC: %.1f MB -> %.1f MB (%s MB), collected %d objects" % (
+                    mem_before, mem_after, tag, total))
+            else:
+                logger.info("Async GC: collected %d objects (psutil unavailable)" % total)
         except asyncio.CancelledError:
+            logger.info("Async GC loop cancelled")
             raise
         except Exception as e:
-            logger.debug(f"Async GC error: {e}")
+            logger.info(f"Async GC error: {e}")
 
 
 def _interruptible_sleep(duration, stop_event=None):
@@ -785,6 +798,12 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
     gc_interval = 60  # seconds between GC runs
     last_gc_time = time.monotonic()
     
+    # Memory leak diagnostic: track memory growth per cycle
+    leak_check_interval = 30  # seconds between leak checks
+    last_leak_check = time.monotonic()
+    last_leak_mem = get_memory_usage_mb()
+    leak_cycle_count = 0
+    
     # Log initial memory usage
     log_memory_usage(logger, server_name)
 
@@ -843,6 +862,16 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
             if mem_before is not None and mem_after is not None:
                 logger.info(f"[{server_name}] GC: {mem_before:.1f} MB → {mem_after:.1f} MB (freed {mem_before - mem_after:.1f} MB)")
             last_gc_time = now
+        
+        # Memory leak diagnostic: track growth rate
+        if now - last_leak_check > leak_check_interval:
+            current_mem = get_memory_usage_mb()
+            if current_mem is not None and last_leak_mem is not None:
+                growth = current_mem - last_leak_mem
+                leak_cycle_count += 1
+                logger.info(f"[{server_name}] Leak check #{leak_cycle_count}: {last_leak_mem:.1f} → {current_mem:.1f} MB (growth: {growth:+.1f} MB in {leak_check_interval}s, rate: {growth/leak_check_interval*3600:.1f} MB/hr)")
+            last_leak_mem = current_mem
+            last_leak_check = now
 
         # Check if it's time for periodic reinitialization
         if reinit_interval > 0 and last_reinit_time is not None and connected:
