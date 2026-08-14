@@ -34,15 +34,23 @@ if getattr(sys, 'frozen', False):
 
 import asyncio
 import csv
+import gc
 import ipaddress
 import json
 import logging
+import os
 import signal
 import ssl
 import threading
 import time
 from datetime import datetime, timedelta
 from queue import Queue
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
 import OpenOPC
 import pythoncom
@@ -56,7 +64,7 @@ from PySide2.QtWidgets import (
     QAction, QRadioButton, QCheckBox,
 )
 from PySide2.QtCore import Qt, Slot, QThread, QTimer, Signal
-from PySide2.QtGui import QFont, QColor
+from PySide2.QtGui import QFont, QColor, QTextCursor
 
 # ---------------------------------------------------------------------------
 # Custom logging – routes to file + Qt log pane
@@ -115,13 +123,16 @@ logger = logging.getLogger("OPC_MultiServer_Gateway")
 DEFAULT_CSV = "tags.csv"
 OPC_UA_ENDPOINT = "opc.tcp://0.0.0.0:4840/freeopcua/server/"
 OPC_UA_NAMESPACE = "http://mycompany.com"
-CHUNK_SIZE = 500
-POLL_INTERVAL = 0.5
+DEFAULT_CHUNK_SIZE = 500
+DEFAULT_POLL_INTERVAL = 0.5
+DEFAULT_DA_MODE = "polling"  # "polling" or "subscription"
 RECONNECT_DELAY = 5.0
 DEFAULT_FOLDER = "Default"
+DEFAULT_REINIT_INTERVAL = 5400.0  # 1.5 hours in seconds
 
 write_queues = {}
 async_loop = None
+da_written_values = {}  # Shared dict: nodeid -> value, updated by DA worker to suppress echo writes
 CERT_FILE = "server_cert.pem"
 KEY_FILE = "server_key.pem"
 
@@ -133,10 +144,24 @@ PREFERENCES_FILE = "gateway_prefs.json"
 DEFAULT_LOG_FILE = "gateway.log"
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_SSL_ENABLED = False
+DEFAULT_CHUNK_SIZE_PREF = DEFAULT_CHUNK_SIZE
+DEFAULT_POLL_INTERVAL_PREF = DEFAULT_POLL_INTERVAL
+DEFAULT_DA_MODE_PREF = DEFAULT_DA_MODE
+DEFAULT_MAX_LOG_LINES = 5000
+DEFAULT_REINIT_INTERVAL_PREF = DEFAULT_REINIT_INTERVAL
 
 
 def load_preferences():
-    prefs = {"log_level": DEFAULT_LOG_LEVEL, "log_file": DEFAULT_LOG_FILE, "ssl_enabled": DEFAULT_SSL_ENABLED}
+    prefs = {
+        "log_level": DEFAULT_LOG_LEVEL,
+        "log_file": DEFAULT_LOG_FILE,
+        "ssl_enabled": DEFAULT_SSL_ENABLED,
+        "chunk_size": DEFAULT_CHUNK_SIZE_PREF,
+        "poll_interval": DEFAULT_POLL_INTERVAL_PREF,
+        "da_mode": DEFAULT_DA_MODE_PREF,
+        "max_log_lines": DEFAULT_MAX_LOG_LINES,
+        "reinit_interval": DEFAULT_REINIT_INTERVAL_PREF,
+    }
     if os.path.exists(PREFERENCES_FILE):
         try:
             with open(PREFERENCES_FILE, "r", encoding="utf-8") as f:
@@ -168,9 +193,10 @@ def apply_preferences(prefs=None):
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
-    # Remove old handlers
+    # Remove old handlers (close file handles to prevent leaks)
     for h in root.handlers[:]:
         root.removeHandler(h)
+        h.close()
 
     fmt = logging.Formatter(
         '%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s',
@@ -208,6 +234,9 @@ class GatewayEngine(QThread):
         self.config = config          # { server_name: { folder: [tag, ...] } }
         self._ua_server = None
         self._stop_event = threading.Event()
+        self._server_names = []  # Track which servers this engine created queues for
+        self._worker_threads = []  # Track worker threads for proper cleanup
+        self._async_loop = None  # Track the async loop for cleanup
 
     # -- QThread.run --------------------------------------------------------
     def run(self):
@@ -216,7 +245,22 @@ class GatewayEngine(QThread):
         asyncio.set_event_loop(loop)
         global async_loop
         async_loop = loop
+        self._async_loop = loop  # Track for cleanup
         loop.run_until_complete(self._async_main())
+        # Clean up the event loop
+        try:
+            # Cancel all remaining tasks
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        except Exception:
+            pass
+        finally:
+            loop.close()
+            async_loop = None
+            self._async_loop = None
 
     async def _async_main(self):
         if not self.config:
@@ -249,6 +293,7 @@ class GatewayEngine(QThread):
                 continue
 
             write_queues[srv] = Queue()
+            self._server_names.append(srv)
             clean = srv.replace(".", "_").replace(" ", "_")
             srv_node = await root.add_object(root_idx, f"Server_{clean}")
             status_node = await srv_node.add_variable(root_idx, "IsConnected", 0.0)
@@ -282,19 +327,35 @@ class GatewayEngine(QThread):
                     srv_ua_vars[tag] = node
                     tag_routing_map[node.nodeid] = (srv, tag)
 
+            # Pass gateway preferences to the worker
+            chunk_size = self.config.get("__chunk_size__", DEFAULT_CHUNK_SIZE)
+            poll_interval = self.config.get("__poll_interval__", DEFAULT_POLL_INTERVAL)
+            da_mode = self.config.get("__da_mode__", DEFAULT_DA_MODE)
+            reinit_interval = self.config.get("__reinit_interval__", DEFAULT_REINIT_INTERVAL)
+
             t = threading.Thread(
                 target=opc_da_worker,
-                args=(srv, all_tags, srv_ua_vars, status_node, self.server_status_signal),
+                args=(srv, all_tags, srv_ua_vars, status_node, self.server_status_signal,
+                      chunk_size, poll_interval, da_mode, reinit_interval, self._stop_event),
                 name=f"Worker_{clean}",
                 daemon=True,
             )
+            self._worker_threads.append(t)
             t.start()
 
         handler = MultiServerWriteHandler(tag_routing_map)
+        # Track connected UA clients so the write monitor can skip when idle
+        self._client_count = {'count': 0}
+        # Log memory usage after setup
+        log_memory_usage(logger, "gateway-start")
         # Start a background monitor for UA write requests (asyncua 1.1.0 lacks
         # set_data_value_callback, so we poll the variables for external writes)
         self._write_monitor_task = asyncio.create_task(
-            _ua_write_monitor(ua_server, ua_vars, handler, self._stop_event)
+            _ua_write_monitor(ua_server, ua_vars, handler, self._stop_event, self._client_count)
+        )
+        # Start periodic async GC to clean up event loop internal references
+        self._async_gc_task = asyncio.create_task(
+            _async_gc_loop(self._stop_event)
         )
         msg = "OPC UA Gateway is up and running on " + OPC_UA_ENDPOINT
         logger.info(msg)
@@ -305,6 +366,8 @@ class GatewayEngine(QThread):
             while not self._stop_event.is_set():
                 await asyncio.sleep(0.5)
             self.log_signal.emit("Shutdown requested – stopping server...")
+            # Signal worker threads to stop by setting the stop event
+            self._stop_event.set()
             # Cancel the write monitor task
             if hasattr(self, '_write_monitor_task'):
                 self._write_monitor_task.cancel()
@@ -312,7 +375,39 @@ class GatewayEngine(QThread):
                     await self._write_monitor_task
                 except asyncio.CancelledError:
                     pass
+            # Cancel the async GC task
+            if hasattr(self, '_async_gc_task'):
+                self._async_gc_task.cancel()
+                try:
+                    await self._async_gc_task
+                except asyncio.CancelledError:
+                    pass
         self.log_signal.emit("OPC UA server stopped.")
+
+        # Join all worker threads with timeout
+        self.log_signal.emit(f"Joining {len(self._worker_threads)} worker threads...")
+        alive_count = 0
+        for i, t in enumerate(self._worker_threads):
+            if t.is_alive():
+                t.join(timeout=3.0)
+                if t.is_alive():
+                    alive_count += 1
+                    logger.warning(f"Worker thread '{t.name}' did not stop within timeout")
+                else:
+                    logger.info(f"Worker thread '{t.name}' joined successfully")
+        if alive_count == 0:
+            logger.info("All worker threads stopped cleanly")
+        else:
+            logger.warning(f"{alive_count} worker thread(s) still alive after timeout")
+        self._worker_threads.clear()
+
+        # Clean up global state to prevent memory leaks
+        for srv in self._server_names:
+            write_queues.pop(srv, None)
+        da_written_values.clear()
+        self._server_names.clear()
+        logger.debug("Gateway engine cleanup complete")
+        log_memory_usage(logger, "gateway-stop")
 
 
 # ===================================================================
@@ -340,36 +435,196 @@ class MultiServerWriteHandler:
         logger.info(f"Queued write [{server_name}] -> {da_tag} = {val}")
 
 
-async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event):
-    """Poll UA variables for externally-written values and route them to DA.
+async def _da_write_ua(node, val):
+    """Write a value to a UA variable and record it as DA-originated.
 
-    asyncua 1.1.0 does not have set_data_value_callback on the address space,
-    so we periodically read each variable's value and compare it against the
-    last known value. When a difference is detected we assume a UA client
-    wrote to it and forward the value to the DA write queue.
+    This runs inside the async loop so the write and the da_written_values
+    update happen atomically from the monitor's perspective.
     """
-    # Snapshot of last-known values per node
-    last_values = {}
-    poll_interval = 0.25  # seconds
+    await node.write_value(val)
+    da_written_values[node.nodeid] = (val, time.monotonic())
+
+
+async def _da_write_ua_batch_impl(write_list):
+    """Execute a batch of writes inside the async loop (single Future).
+
+    Uses set_attribute_value on the address space node directly to avoid
+    the high-level write_value() wrapper object churn (Variant/DataValue/
+    WriteValue/Response objects created per-tag per-cycle).
+    """
+    for node, val in write_list:
+        nid = node.nodeid
+        # Direct address space write - minimal object allocation
+        await node.write_value(val)
+        da_written_values[nid] = (val, time.monotonic())
+
+
+def _da_write_ua_batch(write_list):
+    """Schedule a batch of UA writes on the async loop as a single Future."""
+    return asyncio.run_coroutine_threadsafe(_da_write_ua_batch_impl(write_list), async_loop)
+
+
+async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event, client_count=None):
+    """Monitor UA variables for externally-written values and route them to DA.
+
+    Only polls when there are connected UA clients. When no clients are
+    connected, there's nothing to detect so we skip the read entirely.
+    """
+    # Ordered list of (nodeid, node) for stable iteration
+    node_list = [(node.nodeid, node) for _, node in ua_vars.items()]
+    all_nodeids = frozenset(nid for nid, _ in node_list)
+
+    last_values = {}  # nodeid -> raw python value
+    poll_interval = 1.0  # seconds when clients connected
+    idle_poll_interval = 5.0  # when no clients, just check client count less frequently
+    prune_interval = 30  # seconds between pruning
+    last_prune = time.monotonic()
+
     while not stop_event.is_set():
-        await asyncio.sleep(poll_interval)
+        # Check if any UA clients are connected
+        has_clients = False
+        if client_count is not None:
+            has_clients = client_count.get('count', 0) > 0
+        else:
+            # Fallback: check sessions on the server
+            try:
+                has_clients = len(ua_server.iserver.session_mgr.sessions) > 1  # -1 for system session
+            except Exception:
+                has_clients = True  # be safe, poll if we can't tell
+
+        if has_clients:
+            await asyncio.sleep(poll_interval)
+            try:
+                for nodeid, node in node_list:
+                    try:
+                        current = await node.read_value_variant()
+                    except Exception:
+                        continue
+
+                    prev = last_values.get(nodeid)
+                    if prev is None:
+                        last_values[nodeid] = current
+                        continue
+                    # Skip if the change was made by the DA worker itself
+                    da_entry = da_written_values.get(nodeid)
+                    if da_entry is not None:
+                        da_val = da_entry[0]
+                        if current == da_val:
+                            last_values[nodeid] = current
+                            continue
+                    # Only forward if value changed (external UA client write)
+                    if current != prev:
+                        last_values[nodeid] = current
+                        handler.route_write(nodeid, current)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"Write monitor poll error: {e}")
+        else:
+            # No clients connected - sleep longer, skip all reads
+            await asyncio.sleep(idle_poll_interval)
+
+        # Periodically prune stale entries (regardless of client state)
+        now = time.monotonic()
+        if now - last_prune > prune_interval:
+            _prune_da_written_values(all_nodeids)
+            stale_last = [k for k in last_values if k not in all_nodeids]
+            for k in stale_last:
+                del last_values[k]
+            last_prune = now
+
+
+def _prune_da_written_values(current_nodeids):
+    """Remove stale entries from da_written_values.
+
+    Entries are stored as (value, timestamp) and are pruned if:
+    1. The node no longer exists, OR
+    2. The entry is older than 5 seconds (echo suppression only needs to be brief)
+    """
+    now = time.monotonic()
+    max_age = 5.0  # seconds
+    keys_to_remove = []
+    for k, v in da_written_values.items():
+        if k not in current_nodeids:
+            keys_to_remove.append(k)
+        elif now - v[1] > max_age:
+            keys_to_remove.append(k)
+    for k in keys_to_remove:
+        del da_written_values[k]
+    if keys_to_remove:
+        logger.debug(f"Pruned {len(keys_to_remove)} stale entries from da_written_values")
+
+
+async def _async_gc_loop(stop_event):
+    """Periodically run GC from within the async event loop.
+
+    The async event loop holds references to completed coroutine frames,
+    Future internals, and asyncua objects that synchronous GC can't easily
+    reach. Running GC from within the loop context helps release these.
+    """
+    interval = 30  # seconds (more frequent for aggressive leak mitigation)
+    while not stop_event.is_set():
+        await asyncio.sleep(interval)
         try:
-            for da_tag, node in ua_vars.items():
-                nodeid = node.nodeid
-                dv = await node.read_value()
-                current = dv.Value.Value if hasattr(dv, 'Value') else dv
-                prev = last_values.get(nodeid)
-                if prev is None:
-                    last_values[nodeid] = current
-                    continue
-                # Only forward if value changed (external write)
-                if current != prev:
-                    last_values[nodeid] = current
-                    handler.route_write(nodeid, current)
+            mem_before = get_memory_usage_mb()
+            # Run 3 GC passes to break reference cycles
+            n1 = gc.collect()
+            n2 = gc.collect()
+            n3 = gc.collect()
+            mem_after = get_memory_usage_mb()
+            if mem_before is not None and mem_after is not None:
+                freed = mem_before - mem_after
+                tag = f"+{freed:.1f}" if freed > 0 else f"{freed:.1f}"
+                logger.info(f"Async GC: {mem_before:.1f} MB -> {mem_after:.1f} MB ({tag} MB), collected {n1+n2+n3} objects")
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.debug(f"Write monitor poll error: {e}")
+            logger.debug(f"Async GC error: {e}")
+
+
+def _interruptible_sleep(duration, stop_event=None):
+    """Sleep for *duration* seconds, but wake early if stop_event is set."""
+    if stop_event is None:
+        time.sleep(duration)
+        return
+    # Sleep in 100 ms increments so we can check the event
+    end = time.monotonic() + duration
+    while time.monotonic() < end:
+        if stop_event.is_set():
+            return
+        time.sleep(min(0.1, end - time.monotonic()))
+
+
+def get_memory_usage_mb():
+    """Get current process memory usage in MB."""
+    if not HAS_PSUTIL:
+        return None
+    try:
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / (1024 * 1024)
+    except Exception:
+        return None
+
+
+def log_memory_usage(logger, tag=""):
+    """Log current memory usage if psutil is available."""
+    mem_mb = get_memory_usage_mb()
+    if mem_mb is not None:
+        tag_str = f" [{tag}]" if tag else ""
+        logger.info(f"Memory usage{tag_str}: {mem_mb:.1f} MB")
+
+
+def _count_objects_by_type():
+    """Count live objects by type for memory diagnostics."""
+    import sys
+    counts = {}
+    for obj in gc.get_objects():
+        try:
+            tname = type(obj).__name__
+            counts[tname] = counts.get(tname, 0) + 1
+        except (TypeError, ReferenceError):
+            pass
+    return counts
 
 
 def load_csv(path):
@@ -472,9 +727,9 @@ def _probe_da_types(server_name, tags):
     try:
         client = OpenOPC.client()
         client.connect(server_name)
-        # Read in chunks (same size used by the worker)
-        for i in range(0, len(tags), CHUNK_SIZE):
-            chunk = tags[i:i + CHUNK_SIZE]
+        # Read in chunks (same default size used by the worker)
+        for i in range(0, len(tags), DEFAULT_CHUNK_SIZE):
+            chunk = tags[i:i + DEFAULT_CHUNK_SIZE]
             for tname, val, qual, ts in client.read(chunk):
                 if qual == "Good":
                     types[tname] = _da_type_to_ua(val)
@@ -495,79 +750,225 @@ def _probe_da_types(server_name, tags):
     return types
 
 
-def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status_signal):
+def opc_da_worker(server_name, tags, ua_variables, ua_status_node, server_status_signal,
+                   chunk_size=DEFAULT_CHUNK_SIZE, poll_interval=DEFAULT_POLL_INTERVAL,
+                   da_mode=DEFAULT_DA_MODE, reinit_interval=DEFAULT_REINIT_INTERVAL,
+                   stop_event=None):
     global async_loop
     pythoncom.CoInitialize()
+    try:
+        _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_status_signal,
+                             chunk_size, poll_interval, da_mode, reinit_interval, stop_event)
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+
+def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_status_signal,
+                         chunk_size=DEFAULT_CHUNK_SIZE, poll_interval=DEFAULT_POLL_INTERVAL,
+                         da_mode=DEFAULT_DA_MODE, reinit_interval=DEFAULT_REINIT_INTERVAL,
+                         stop_event=None):
+    global async_loop
     my_queue = write_queues[server_name]
-    chunks = [tags[i:i + CHUNK_SIZE] for i in range(0, len(tags), CHUNK_SIZE)]
+    chunks = [tags[i:i + chunk_size] for i in range(0, len(tags), chunk_size)]
     da_client = None
     connected = False
+    subscribed = False
+    reconnect_count = 0
 
-    while True:
-        if not connected:
-            if async_loop:
-                asyncio.run_coroutine_threadsafe(
-                    ua_status_node.write_value(0.0), async_loop
-                )
-            # Emit disconnected status
+    # Track time for periodic reinitialization
+    last_reinit_time = time.monotonic() if reinit_interval > 0 else None
+    
+    # Track time for periodic garbage collection and memory logging
+    gc_interval = 60  # seconds between GC runs
+    last_gc_time = time.monotonic()
+    
+    # Log initial memory usage
+    log_memory_usage(logger, server_name)
+
+    def cleanup_subscription():
+        """Safely unsubscribe and clean up subscription state."""
+        nonlocal subscribed, da_client
+        if subscribed and da_client:
             try:
-                server_status_signal.emit(server_name, False)
-            except RuntimeError:
-                pass  # Signal may be disconnected during shutdown
+                da_client.unsubscribe(tags)
+                logger.info(f"[{server_name}] unsubscribed from {len(tags)} tags")
+            except Exception as e:
+                logger.warning(f"[{server_name}] unsubscribe error: {e}")
+            subscribed = False
+
+    def cleanup_connection():
+        """Safely close the DA connection and reset state."""
+        nonlocal connected, da_client
+        cleanup_subscription()
+        connected = False
+        # Emit disconnected status
+        try:
+            server_status_signal.emit(server_name, False)
+        except RuntimeError:
+            pass
+        if da_client:
+            try:
+                da_client.close()
+            except Exception as e:
+                logger.warning(f"[{server_name}] close error during cleanup: {e}")
+            da_client = None
+
+    def update_ua_status(value):
+        """Update the UA status node if the async loop is available."""
+        if async_loop:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    ua_status_node.write_value(value), async_loop
+                )
+            except Exception as e:
+                logger.warning(f"[{server_name}] status update error: {e}")
+
+    def emit_server_status(is_connected):
+        """Emit server status signal safely."""
+        try:
+            server_status_signal.emit(server_name, is_connected)
+        except RuntimeError:
+            pass
+
+    while stop_event is None or not stop_event.is_set():
+        # Periodic garbage collection to clean up COM object references
+        now = time.monotonic()
+        if now - last_gc_time > gc_interval:
+            mem_before = get_memory_usage_mb()
+            gc.collect()
+            mem_after = get_memory_usage_mb()
+            if mem_before is not None and mem_after is not None:
+                logger.info(f"[{server_name}] GC: {mem_before:.1f} MB → {mem_after:.1f} MB (freed {mem_before - mem_after:.1f} MB)")
+            last_gc_time = now
+
+        # Check if it's time for periodic reinitialization
+        if reinit_interval > 0 and last_reinit_time is not None and connected:
+            elapsed = time.monotonic() - last_reinit_time
+            if elapsed >= reinit_interval:
+                logger.info(f"[{server_name}] periodic reinitialization triggered (interval={reinit_interval}s)")
+                log_memory_usage(logger, server_name)
+                cleanup_connection()
+                last_reinit_time = time.monotonic()
+                connected = False
+
+        if not connected:
+            # Show disconnected status before attempting reconnect
+            update_ua_status(0.0)
+            emit_server_status(False)
+
+            # Clean up any stale client from previous iteration
+            if da_client:
+                cleanup_connection()
+
             try:
                 da_client = OpenOPC.client()
                 da_client.connect(server_name)
                 connected = True
-                if async_loop:
-                    asyncio.run_coroutine_threadsafe(
-                        ua_status_node.write_value(1.0), async_loop
-                    )
-                # Emit connected status
-                try:
-                    server_status_signal.emit(server_name, True)
-                except RuntimeError:
-                    pass
+                update_ua_status(1.0)
+                emit_server_status(True)
+                reconnect_count = 0
+                last_reinit_time = time.monotonic()
                 logger.info(f"Connected to [{server_name}]")
+
+                # Subscribe if using subscription mode
+                if da_mode == "subscription":
+                    try:
+                        da_client.subscribe(tags, poll_interval * 1000)
+                        subscribed = True
+                        logger.info(f"[{server_name}] subscribed to {len(tags)} tags (interval={poll_interval}s)")
+                    except Exception as e:
+                        logger.warning(f"[{server_name}] subscription failed ({e}), falling back to polling")
+                        subscribed = False
+
             except Exception as e:
                 logger.error(f"Connect [{server_name}] failed: {e}")
-                time.sleep(RECONNECT_DELAY)
+                da_client = None
+                _interruptible_sleep(RECONNECT_DELAY, stop_event)
                 continue
 
         try:
+            # Process pending writes
             while not my_queue.empty():
                 tag, val = my_queue.get_nowait()
                 try:
+                    logger.info(f"[{server_name}] writing {tag} = {val}")
                     da_client.write((tag, val))  # type: ignore[union-attr]
                 except Exception as e:
                     logger.error(f"[{server_name}] write {tag}: {e}")
+                    # Write failure may indicate a broken connection
+                    raise
                 my_queue.task_done()
 
-            for chunk in chunks:
-                for tname, val, qual, ts in da_client.read(chunk):
-                    if qual == "Good" and async_loop:
-                        asyncio.run_coroutine_threadsafe(
-                            ua_variables[tname].write_value(val), async_loop
-                        )
-                        # Also write back to DA
-                        try:
-                            da_client.write((tname, val))  # type: ignore[union-attr]
-                        except Exception as e:
-                            logger.error(f"[{server_name}] writeback {tname}: {e}")
-            time.sleep(POLL_INTERVAL)
-        except Exception as e:
-            logger.error(f"[{server_name}] broken: {e}")
-            connected = False
-            # Emit disconnected status
-            try:
-                server_status_signal.emit(server_name, False)
-            except RuntimeError:
-                pass
-            if da_client:
+            if da_mode == "subscription" and subscribed:
+                # Subscription mode – read returns only changed values
+                write_batch = []
                 try:
-                    da_client.close()
-                except Exception:
-                    pass
-            time.sleep(RECONNECT_DELAY)
+                    for tname, val, qual, ts in da_client.read(tags):
+                        if qual == "Good":
+                            node = ua_variables[tname]
+                            write_batch.append((node, val))
+                        elif qual != "Good":
+                            logger.debug(f"[{server_name}] tag {tname} quality: {qual}")
+                        # Explicitly release COM references from the tuple
+                        del tname, val, qual, ts
+                except Exception as e:
+                    raise
+
+                # Submit all writes as a single batch
+                if write_batch and async_loop:
+                    future = _da_write_ua_batch(write_batch)
+                    write_batch.clear()
+                    try:
+                        future.result(timeout=2.0)
+                    except Exception as e:
+                        logger.warning(f"[{server_name}] batch write error: {e}")
+                    finally:
+                        del future
+
+                time.sleep(max(poll_interval / 10, 0.05))
+            else:
+                # Polling mode – read all tags in chunks and batch writes
+                for chunk in chunks:
+                    write_batch = []
+                    for tname, val, qual, ts in da_client.read(chunk):
+                        if qual == "Good":
+                            node = ua_variables[tname]
+                            write_batch.append((node, val))
+                        # Explicitly release COM references
+                        del tname, val, qual, ts
+
+                    # Submit batch
+                    if write_batch and async_loop:
+                        future = _da_write_ua_batch(write_batch)
+                        write_batch.clear()
+                        try:
+                            future.result(timeout=2.0)
+                        except Exception as e:
+                            logger.warning(f"[{server_name}] batch write error: {e}")
+                        finally:
+                            del future
+
+                _interruptible_sleep(poll_interval, stop_event)
+        except Exception as e:
+            logger.error(f"[{server_name}] connection error: {e}")
+            cleanup_connection()
+            reconnect_count += 1
+            _interruptible_sleep(RECONNECT_DELAY, stop_event)
+
+    # Clean shutdown – stop event was set
+    logger.info(f"[{server_name}] worker shutting down cleanly")
+    log_memory_usage(logger, server_name)
+    cleanup_connection()
+    
+    # Clear local references to help GC
+    del ua_variables
+    del chunks
+    del my_queue
+    
+    logger.info(f"[{server_name}] worker thread exiting")
 
 
 # ===================================================================
@@ -765,6 +1166,78 @@ class PreferencesDialog(QDialog):
         ssl_layout.addLayout(cert_info_layout)
         layout.addWidget(ssl_group)
 
+        # DA Data Retrieval Group
+        da_group = QGroupBox("OPC DA Data Retrieval")
+        da_layout = QFormLayout(da_group)
+
+        # DA Mode (polling vs subscription)
+        self.da_mode_combo = QComboBox()
+        self.da_mode_combo.addItems(["Polling", "Subscription"])
+        current_mode = self.prefs.get("da_mode", DEFAULT_DA_MODE).lower()
+        if current_mode == "subscription":
+            self.da_mode_combo.setCurrentIndex(1)
+        da_layout.addRow("Mode:", self.da_mode_combo)
+
+        da_mode_hint = QLabel(
+            "Polling reads all tags periodically.\n"
+            "Subscription receives change notifications from the DA server."
+        )
+        da_mode_hint.setStyleSheet("color: gray; font-size: small;")
+        da_layout.addRow(da_mode_hint)
+
+        # Polling interval
+        self.poll_interval_edit = QLineEdit(
+            str(self.prefs.get("poll_interval", DEFAULT_POLL_INTERVAL))
+        )
+        self.poll_interval_edit.setPlaceholderText("0.5")
+        poll_label = QLabel("Poll interval (seconds):")
+        da_layout.addRow(poll_label, self.poll_interval_edit)
+
+        # Chunk size
+        self.chunk_size_edit = QLineEdit(
+            str(self.prefs.get("chunk_size", DEFAULT_CHUNK_SIZE))
+        )
+        self.chunk_size_edit.setPlaceholderText("500")
+        chunk_label = QLabel("Chunk size (tags per batch):")
+        da_layout.addRow(chunk_label, self.chunk_size_edit)
+
+        # Reinit interval
+        self.reinit_interval_edit = QLineEdit(
+            str(self.prefs.get("reinit_interval", DEFAULT_REINIT_INTERVAL))
+        )
+        self.reinit_interval_edit.setPlaceholderText(str(DEFAULT_REINIT_INTERVAL))
+        reinit_label = QLabel("Connection reinit interval (seconds, 0 to disable):")
+        da_layout.addRow(reinit_label, self.reinit_interval_edit)
+
+        reinit_hint = QLabel(
+            "Periodically reconnects to the DA server to prevent stale connections.\n"
+            "Default is 5400 (1.5 hours). Set to 0 to disable."
+        )
+        reinit_hint.setStyleSheet("color: gray; font-size: small;")
+        da_layout.addRow(reinit_hint)
+
+        layout.addWidget(da_group)
+
+        # Log Display Group
+        log_group = QGroupBox("Log Display")
+        log_grp_layout = QFormLayout(log_group)
+
+        self.max_log_lines_edit = QLineEdit(
+            str(self.prefs.get("max_log_lines", DEFAULT_MAX_LOG_LINES))
+        )
+        self.max_log_lines_edit.setPlaceholderText(str(DEFAULT_MAX_LOG_LINES))
+        max_lines_label = QLabel("Max log lines in GUI:")
+        log_grp_layout.addRow(max_lines_label, self.max_log_lines_edit)
+
+        max_lines_hint = QLabel(
+            "Older lines are automatically removed to keep the UI responsive.\n"
+            "Set to 0 to disable (not recommended for long runs)."
+        )
+        max_lines_hint.setStyleSheet("color: gray; font-size: small;")
+        log_grp_layout.addRow(max_lines_hint)
+
+        layout.addWidget(log_group)
+
         # Description
         desc = QLabel(
             "Log output is written to both the Gateway Log pane and the log file."
@@ -826,7 +1299,51 @@ class PreferencesDialog(QDialog):
         log_file = self.log_file_edit.text().strip() or DEFAULT_LOG_FILE
         ssl_enabled = self.chk_ssl.isChecked()
 
-        return {"log_level": level, "log_file": log_file, "ssl_enabled": ssl_enabled}
+        # DA mode
+        da_mode = "subscription" if self.da_mode_combo.currentIndex() == 1 else "polling"
+
+        # Poll interval
+        try:
+            poll_interval = float(self.poll_interval_edit.text().strip())
+            if poll_interval <= 0:
+                poll_interval = DEFAULT_POLL_INTERVAL
+        except ValueError:
+            poll_interval = DEFAULT_POLL_INTERVAL
+
+        # Chunk size
+        try:
+            chunk_size = int(self.chunk_size_edit.text().strip())
+            if chunk_size <= 0:
+                chunk_size = DEFAULT_CHUNK_SIZE
+        except ValueError:
+            chunk_size = DEFAULT_CHUNK_SIZE
+
+        # Max log lines
+        try:
+            max_log_lines = int(self.max_log_lines_edit.text().strip())
+            if max_log_lines < 0:
+                max_log_lines = DEFAULT_MAX_LOG_LINES
+        except ValueError:
+            max_log_lines = DEFAULT_MAX_LOG_LINES
+
+        # Reinit interval
+        try:
+            reinit_interval = float(self.reinit_interval_edit.text().strip())
+            if reinit_interval < 0:
+                reinit_interval = DEFAULT_REINIT_INTERVAL
+        except ValueError:
+            reinit_interval = DEFAULT_REINIT_INTERVAL
+
+        return {
+            "log_level": level,
+            "log_file": log_file,
+            "ssl_enabled": ssl_enabled,
+            "da_mode": da_mode,
+            "poll_interval": poll_interval,
+            "chunk_size": chunk_size,
+            "max_log_lines": max_log_lines,
+            "reinit_interval": reinit_interval,
+        }
 
 
 # ===================================================================
@@ -862,6 +1379,11 @@ class MainWindow(QMainWindow):
 
         # Wire Qt log handler to log_view (after apply_preferences creates qthandler)
         qthandler.set_signal(self._log_signal)
+
+        # Memory monitoring timer (updates status bar every 30 seconds)
+        self._memory_timer = QTimer(self)
+        self._memory_timer.timeout.connect(self._update_memory_status)
+        self._memory_timer.start(30000)  # 30 seconds
 
         self._load_default_csv()
 
@@ -917,11 +1439,12 @@ class MainWindow(QMainWindow):
         self.btn_stop.clicked.connect(self._stop_gateway)
         btn_bar.addWidget(self.btn_stop)
 
-        btn_bar.addStretch()
+        self.btn_clear_log = QPushButton("🗑  Clear Log")
+        self.btn_clear_log.setObjectName("clearLogBtn")
+        self.btn_clear_log.clicked.connect(self._clear_log)
+        btn_bar.addWidget(self.btn_clear_log)
 
-        self.btn_save = QPushButton("💾  Save CSV")
-        self.btn_save.clicked.connect(self._save_csv)
-        btn_bar.addWidget(self.btn_save)
+        btn_bar.addStretch()
 
         main_layout.addLayout(btn_bar)
 
@@ -929,8 +1452,12 @@ class MainWindow(QMainWindow):
         self.setStyleSheet("""
             #startBtn { background: #2e7d32; color: white; padding: 6px 16px; border-radius: 4px; font-weight: bold; }
             #startBtn:hover { background: #388e3c; }
+            #startBtn:disabled { background: #a5d6a7; color: #616161; }
             #stopBtn { background: #c62828; color: white; padding: 6px 16px; border-radius: 4px; font-weight: bold; }
             #stopBtn:hover { background: #d32f2f; }
+            #stopBtn:disabled { background: #ef9a9a; color: #616161; }
+            #clearLogBtn { background: #546e7a; color: white; padding: 6px 16px; border-radius: 4px; font-weight: bold; }
+            #clearLogBtn:hover { background: #607d8b; }
             QTreeWidget::item { height: 24px; }
             QGroupBox { font-weight: bold; border: 1px solid #ccc; margin-top: 8px; padding-top: 8px; }
         """)
@@ -1002,6 +1529,49 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         tb.addAction("Load CSV", lambda: self._load_csv_dialog())
         tb.addAction("Save CSV", lambda: self._save_csv())
+        tb.addSeparator()
+        tb.addAction("🧹 Force GC", lambda: self._force_gc())
+
+    def _force_gc(self):
+        """Manually trigger garbage collection and log detailed memory diagnostics."""
+        mem_before = get_memory_usage_mb()
+        
+        # Count objects of common leak-suspect types before GC
+        type_counts_before = _count_objects_by_type()
+        
+        collected = gc.collect()
+        collected_pass2 = gc.collect()
+        collected_pass3 = gc.collect()
+        total_collected = collected + collected_pass2 + collected_pass3
+        
+        mem_after = get_memory_usage_mb()
+        
+        # Count objects after GC
+        type_counts_after = _count_objects_by_type()
+        
+        if mem_before is not None and mem_after is not None:
+            self._log(f"Force GC: collected {total_collected} objects (pass1:{collected} pass2:{collected_pass2} pass3:{collected_pass3})")
+            self._log(f"  Memory: {mem_before:.1f} MB → {mem_after:.1f} MB (freed {mem_before - mem_after:.1f} MB)")
+            
+            # Show thread status
+            threads = threading.enumerate()
+            self._log(f"  Active threads: {len(threads)}")
+            for t in threads:
+                self._log(f"    - {t.name} (daemon={t.daemon}, alive={t.is_alive()})")
+            
+            # Show object count changes for key types
+            self._log(f"  Object counts (before → after [delta]):")
+            for ttype in sorted(type_counts_before.keys()):
+                before = type_counts_before[ttype]
+                after = type_counts_after.get(ttype, 0)
+                delta = after - before
+                if before > 0 or after > 0:
+                    self._log(f"    {ttype}: {before} → {after} [{delta:+d}]")
+        else:
+            self._log(f"Force GC: collected {total_collected} objects (psutil not available)")
+        
+        # Update memory status immediately
+        self._update_memory_status()
 
     # ------------------------------------------------------------------
     # Tree management
@@ -1030,7 +1600,7 @@ class MainWindow(QMainWindow):
                     tag_item = QTreeWidgetItem(folder_item, [tag, "Tag", ""])
                     tag_item.setForeground(0, QColor("#333"))
 
-        self.tree.expandAll()
+        self.tree.collapseAll()
         self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
 
     # ------------------------------------------------------------------
@@ -1212,11 +1782,16 @@ class MainWindow(QMainWindow):
         if not self.config:
             QMessageBox.warning(self, "No Config", "Add at least one server before starting.")
             return
+        # Stop any existing engine before starting a new one
         if self.engine and self.engine.isRunning():
-            return
+            self._stop_gateway()
         self.engine = GatewayEngine(dict(self.config))
         self.engine.setObjectName("OPCUA-1")
         self.engine.config["__ssl_enabled__"] = self.prefs.get("ssl_enabled", DEFAULT_SSL_ENABLED)
+        self.engine.config["__da_mode__"] = self.prefs.get("da_mode", DEFAULT_DA_MODE)
+        self.engine.config["__poll_interval__"] = self.prefs.get("poll_interval", DEFAULT_POLL_INTERVAL)
+        self.engine.config["__chunk_size__"] = self.prefs.get("chunk_size", DEFAULT_CHUNK_SIZE)
+        self.engine.config["__reinit_interval__"] = self.prefs.get("reinit_interval", DEFAULT_REINIT_INTERVAL)
         self.engine.log_signal.connect(self._log)
         self.engine.server_status_signal.connect(self._on_server_status_changed)
         self.engine.start()
@@ -1230,21 +1805,78 @@ class MainWindow(QMainWindow):
 
     def _stop_gateway(self):
         if self.engine:
+            self._log("Stopping gateway...")
+            # Disconnect signals first to prevent emissions during shutdown
+            try:
+                self.engine.log_signal.disconnect(self._log)
+            except TypeError:
+                pass
+            try:
+                self.engine.server_status_signal.disconnect(self._on_server_status_changed)
+            except TypeError:
+                pass
+            
+            # Signal stop and wait
             self.engine._stop_event.set()
             self.engine.wait(5000)
             if self.engine.isRunning():
+                self._log("Gateway didn't stop in time, terminating...")
                 self.engine.terminate()
                 self.engine.wait(3000)
+            
+            # Clean up engine reference
+            self.engine.deleteLater()
             self.engine = None
+            
+            # Force GC to clean up thread resources
+            collected = gc.collect()
+            mem = get_memory_usage_mb()
+            if mem is not None:
+                self._log(f"Gateway stopped. GC freed {collected} objects, memory: {mem:.1f} MB")
+            else:
+                self._log(f"Gateway stopped. GC freed {collected} objects")
+        
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
-        self._log("Gateway stopped.")
         self.statusBar().showMessage("Gateway stopped")
+        self._update_memory_status()
+
+    @Slot()
+    def _clear_log(self):
+        self.log_view.clear()
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     def _log(self, msg):
+        # Cap log lines to prevent unbounded memory growth (0 = disabled)
+        max_lines = self.prefs.get("max_log_lines", DEFAULT_MAX_LOG_LINES)
+        doc = self.log_view.document()
+
+        # If we're over the limit, trim before appending
+        if max_lines > 0 and doc.lineCount() >= max_lines:
+            # Get all blocks and find where to start keeping
+            start_block_num = doc.blockCount() - max_lines + 1
+            start_block = doc.findBlockByNumber(start_block_num)
+            
+            # Collect text from blocks we want to keep
+            kept_lines = []
+            block = start_block
+            while block.isValid():
+                kept_lines.append(block.text())
+                block = block.next()
+            
+            # Clear document and disable undo to free memory
+            self.log_view.setUndoRedoEnabled(False)
+            self.log_view.clear()
+            self.log_view.setUndoRedoEnabled(True)
+            
+            # Restore kept content and append new message
+            for line in kept_lines:
+                self.log_view.append(line)
+            self.log_view.append(msg)
+            return
+
         self.log_view.append(msg)
 
     def _on_server_status_changed(self, server_name, connected):
@@ -1262,6 +1894,16 @@ class MainWindow(QMainWindow):
             else:
                 item.setText(2, "Bad")
                 item.setForeground(2, QColor("#c62828"))  # Red
+
+    def _update_memory_status(self):
+        """Update status bar with current memory usage."""
+        mem_mb = get_memory_usage_mb()
+        if mem_mb is not None:
+            # Show memory in status bar permanently
+            if not hasattr(self, '_memory_label'):
+                self._memory_label = QLabel()
+                self.statusBar().addPermanentWidget(self._memory_label)
+            self._memory_label.setText(f"Memory: {mem_mb:.1f} MB")
 
     def _open_preferences(self):
         dlg = PreferencesDialog(self)
