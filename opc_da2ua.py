@@ -132,6 +132,7 @@ DEFAULT_REINIT_INTERVAL = 5400.0  # 1.5 hours in seconds
 
 write_queues = {}
 async_loop = None
+ua_server_global = None  # Global reference to the asyncua Server for batch writes
 da_written_values = {}  # Shared dict: nodeid -> value, updated by DA worker to suppress echo writes
 CERT_FILE = "server_cert.pem"
 KEY_FILE = "server_key.pem"
@@ -363,6 +364,8 @@ class GatewayEngine(QThread):
         logger.info(msg)
         self.log_signal.emit(msg)
         self._ua_server = ua_server
+        global ua_server_global
+        ua_server_global = ua_server
 
         async with ua_server:
             while not self._stop_event.is_set():
@@ -408,6 +411,8 @@ class GatewayEngine(QThread):
             write_queues.pop(srv, None)
         da_written_values.clear()
         self._server_names.clear()
+        global ua_server_global
+        ua_server_global = None
         logger.debug("Gateway engine cleanup complete")
         log_memory_usage(logger, "gateway-stop")
 
@@ -480,7 +485,7 @@ async def _da_write_ua_batch_impl(ua_server, write_list):
 
 def _da_write_ua_batch(write_list):
     """Schedule a batch of UA writes on the async loop as a single Future."""
-    return asyncio.run_coroutine_threadsafe(_da_write_ua_batch_impl(async_loop, write_list), async_loop)
+    return asyncio.run_coroutine_threadsafe(_da_write_ua_batch_impl(ua_server_global, write_list), async_loop)
 
 
 async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event, client_count=None):
