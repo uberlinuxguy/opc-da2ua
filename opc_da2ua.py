@@ -270,6 +270,11 @@ def apply_preferences(prefs=None):
     verbose = bool(prefs.get("verbose_asyncua", False)) or level_str == VERBOSE_LOG_LEVEL
     logging.getLogger("asyncua").setLevel(logging.DEBUG if verbose else logging.WARNING)
 
+    # asyncua logs incoming connections ("New connection from ...") at INFO
+    # level, but the logger above is capped at WARNING. Keep the binary
+    # transport logger at INFO so client IPs are always recorded.
+    logging.getLogger("asyncua.server.binary_server_asyncio").setLevel(logging.INFO)
+
     logger.info(f"Logging configured: level={level_str}, file={log_file}, asyncua={'verbose' if verbose else 'quiet'}")
 
 
