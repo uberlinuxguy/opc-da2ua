@@ -1042,7 +1042,7 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                 # Subscription mode – read returns only changed values
                 write_batch = []
                 try:
-                    for tname, val, qual, ts in da_client.read(tags):
+                    for tname, val, qual, ts in da_client.read(tags, group=f"{server_name}_sub"):
                         if qual == "Good":
                             node = ua_variables[tname]
                             write_batch.append((node, val))
@@ -1066,9 +1066,9 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                 time.sleep(max(poll_interval / 10, 0.05))
             else:
                 # Polling mode – read all tags in chunks and batch writes
-                for chunk in chunks:
+                for ci, chunk in enumerate(chunks):
                     write_batch = []
-                    for tname, val, qual, ts in da_client.read(chunk):
+                    for tname, val, qual, ts in da_client.read(chunk, group=f"{server_name}_g{ci}"):
                         if qual == "Good":
                             node = ua_variables[tname]
                             write_batch.append((node, val))
