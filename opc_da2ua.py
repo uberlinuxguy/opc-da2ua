@@ -991,15 +991,10 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
     log_memory_usage(logger, server_name)
 
     def cleanup_subscription():
-        """Safely unsubscribe and clean up subscription state."""
-        nonlocal subscribed, da_client
-        if subscribed and da_client:
-            try:
-                da_client.unsubscribe(tags)
-                logger.info(f"[{server_name}] unsubscribed from {len(tags)} tags")
-            except Exception as e:
-                logger.warning(f"[{server_name}] unsubscribe error: {e}")
-            subscribed = False
+        """Reset subscription state. OpenOPC manages OPC DA groups internally;
+        closing the client (done in cleanup_connection) removes the groups."""
+        nonlocal subscribed
+        subscribed = False
 
     def cleanup_connection():
         """Safely close the DA connection and reset state."""
@@ -1077,15 +1072,18 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                 last_reinit_time = time.monotonic()
                 logger.info(f"Connected to [{server_name}]")
 
-                # Subscribe if using subscription mode
+                # Subscription mode: OpenOPC creates the OPC DA group on the
+                # first read() call; the update rate is set via the update=
+                # argument at that time (see subscription read below).
                 if da_mode == "subscription":
+                    # Remove any stale subscription group so the first read()
+                    # recreates it with the current update rate.
                     try:
-                        da_client.subscribe(tags, poll_interval * 1000)
-                        subscribed = True
-                        logger.info(f"[{server_name}] subscribed to {len(tags)} tags (interval={poll_interval}s)")
+                        da_client.remove([f"{server_name}_sub"])
                     except Exception as e:
-                        logger.warning(f"[{server_name}] subscription failed ({e}), falling back to polling")
-                        subscribed = False
+                        logger.debug(f"[{server_name}] group remove before subscribe: {e}")
+                    subscribed = True
+                    logger.info(f"[{server_name}] subscription mode enabled (interval={poll_interval}s)")
 
             except Exception as e:
                 logger.error(f"Connect [{server_name}] failed: {e}")
@@ -1107,10 +1105,12 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                 my_queue.task_done()
 
             if da_mode == "subscription" and subscribed:
-                # Subscription mode – read returns only changed values
+                # Subscription mode – read returns only changed values.
+                # update= sets the group's update rate (ms) when the group is
+                # first created; it is ignored on subsequent reads.
                 write_batch = []
                 try:
-                    for tname, val, qual, ts in da_client.read(tags, group=f"{server_name}_sub"):
+                    for tname, val, qual, ts in da_client.read(tags, group=f"{server_name}_sub", update=int(poll_interval * 1000)):
                         if qual == "Good":
                             node = ua_variables[tname]
                             write_batch.append((node, val))
