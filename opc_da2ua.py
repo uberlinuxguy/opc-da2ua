@@ -177,6 +177,8 @@ write_queues = {}
 async_loop = None
 ua_server_global = None  # Global reference to the asyncua Server for batch writes
 da_written_values = {}  # Shared dict: nodeid -> value, updated by DA worker to suppress echo writes
+_node_variant_types = {}  # nodeid -> VariantType, cached to skip _guess_type() per write
+_node_datavalues = {}     # nodeid -> DataValue, reused to avoid per-write allocation
 CERT_FILE = "server_cert.pem"
 KEY_FILE = "server_key.pem"
 
@@ -456,6 +458,8 @@ class GatewayEngine(QThread):
         for srv in self._server_names:
             write_queues.pop(srv, None)
         da_written_values.clear()
+        _node_variant_types.clear()
+        _node_datavalues.clear()
         self._server_names.clear()
         
         ua_server_global = None
@@ -515,8 +519,8 @@ async def _da_write_ua_batch_direct_impl(ua_server, write_list):
     Bypasses asyncua's session-based write stack (write_value →
     write_attribute → session.write) which allocates WriteValue,
     WriteParameters, ServerItemCallback, and DataValue objects per tag
-    per cycle.  Instead we set the AttributeValue.value in place, which
-    is what the session write path ultimately does anyway.
+    per cycle.  Instead we mutate the AttributeValue in place, reusing
+    the DataValue and Variant objects to minimise per-write allocation.
     """
     aspace = ua_server.iserver.aspace
     for node, val in write_list:
@@ -526,8 +530,22 @@ async def _da_write_ua_batch_direct_impl(ua_server, write_list):
             if ua_node is not None:
                 attval = ua_node.attributes.get(ua.AttributeIds.Value)
                 if attval is not None:
-                    variant = ua.Variant(val)
-                    attval.value = ua.DataValue(variant)
+                    # Reuse the existing DataValue/Variant to avoid
+                    # allocating new objects every poll cycle.
+                    dv = attval.value
+                    if dv is not None and dv.Value is not None:
+                        dv.Value.Value = val
+                        attval.value = dv
+                    else:
+                        # First write to this node – create the objects
+                        vtype = _node_variant_types.get(nid)
+                        if vtype is None:
+                            vtype = ua.Variant(val).VariantType
+                            _node_variant_types[nid] = vtype
+                        variant = ua.Variant(val, vtype)
+                        dv = ua.DataValue(variant)
+                        attval.value = dv
+                        _node_datavalues[nid] = dv
                 else:
                     await node.write_value(val)
             else:
