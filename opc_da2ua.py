@@ -189,6 +189,7 @@ KEY_FILE = "server_key.pem"
 PREFERENCES_FILE = "gateway_prefs.json"
 DEFAULT_LOG_FILE = "gateway.log"
 DEFAULT_LOG_LEVEL = "INFO"
+VERBOSE_LOG_LEVEL = "VERBOSE"  # INFO + asyncua per-request tracing
 DEFAULT_SSL_ENABLED = False
 DEFAULT_CHUNK_SIZE_PREF = DEFAULT_CHUNK_SIZE
 DEFAULT_POLL_INTERVAL_PREF = DEFAULT_POLL_INTERVAL
@@ -201,6 +202,7 @@ def load_preferences():
     prefs = {
         "log_level": DEFAULT_LOG_LEVEL,
         "log_file": DEFAULT_LOG_FILE,
+        "verbose_asyncua": False,
         "ssl_enabled": DEFAULT_SSL_ENABLED,
         "chunk_size": DEFAULT_CHUNK_SIZE_PREF,
         "poll_interval": DEFAULT_POLL_INTERVAL_PREF,
@@ -262,7 +264,13 @@ def apply_preferences(prefs=None):
     qthandler.setLevel(level)
     root.addHandler(qthandler)
 
-    logger.info(f"Logging configured: level={level_str}, file={log_file}")
+    # asyncua logs every protocol request (Browse/Read/Write/Subscribe...) at
+    # INFO level, which floods the log when a client browses the address space.
+    # Keep it at WARNING unless verbose tracing is explicitly enabled.
+    verbose = bool(prefs.get("verbose_asyncua", False)) or level_str == VERBOSE_LOG_LEVEL
+    logging.getLogger("asyncua").setLevel(logging.DEBUG if verbose else logging.WARNING)
+
+    logger.info(f"Logging configured: level={level_str}, file={log_file}, asyncua={'verbose' if verbose else 'quiet'}")
 
 
 # ===================================================================
@@ -1244,9 +1252,12 @@ class PreferencesDialog(QDialog):
         self.radio_info = QRadioButton("Info")
         self.radio_warning = QRadioButton("Warning")
         self.radio_error = QRadioButton("Error")
+        self.radio_verbose = QRadioButton("Verbose (incl. OPC UA request tracing)")
 
         current_level = self.prefs.get("log_level", DEFAULT_LOG_LEVEL).upper()
-        if current_level == "INFO":
+        if current_level == VERBOSE_LOG_LEVEL:
+            self.radio_verbose.setChecked(True)
+        elif current_level == "INFO":
             self.radio_info.setChecked(True)
         elif current_level == "WARNING":
             self.radio_warning.setChecked(True)
@@ -1256,6 +1267,17 @@ class PreferencesDialog(QDialog):
         log_level_layout.addWidget(self.radio_info)
         log_level_layout.addWidget(self.radio_warning)
         log_level_layout.addWidget(self.radio_error)
+        log_level_layout.addWidget(self.radio_verbose)
+
+        self.chk_verbose_asyncua = QCheckBox("Log every OPC UA request (Browse/Read/Write/Subscribe...)")
+        self.chk_verbose_asyncua.setChecked(self.prefs.get("verbose_asyncua", False))
+        verbose_hint = QLabel(
+            "asyncua logs each protocol request at INFO level, which can flood\n"
+            "the log when clients browse the address space. Enable only for debugging."
+        )
+        verbose_hint.setStyleSheet("color: gray; font-size: small;")
+        log_level_layout.addWidget(self.chk_verbose_asyncua)
+        log_level_layout.addWidget(verbose_hint)
         layout.addWidget(log_level_group)
 
         # Log File Group
@@ -1423,7 +1445,9 @@ class PreferencesDialog(QDialog):
             QMessageBox.critical(self, "Error", f"Failed to generate certificate: {e}")
 
     def get_prefs(self):
-        if self.radio_info.isChecked():
+        if self.radio_verbose.isChecked():
+            level = VERBOSE_LOG_LEVEL
+        elif self.radio_info.isChecked():
             level = "INFO"
         elif self.radio_warning.isChecked():
             level = "WARNING"
@@ -1431,6 +1455,7 @@ class PreferencesDialog(QDialog):
             level = "ERROR"
 
         log_file = self.log_file_edit.text().strip() or DEFAULT_LOG_FILE
+        verbose_asyncua = self.chk_verbose_asyncua.isChecked()
         ssl_enabled = self.chk_ssl.isChecked()
 
         # DA mode
@@ -1471,6 +1496,7 @@ class PreferencesDialog(QDialog):
         return {
             "log_level": level,
             "log_file": log_file,
+            "verbose_asyncua": verbose_asyncua,
             "ssl_enabled": ssl_enabled,
             "da_mode": da_mode,
             "poll_interval": poll_interval,
