@@ -570,7 +570,11 @@ async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event, client_coun
 
     Only polls when there are connected UA clients. When no clients are
     connected, there's nothing to detect so we skip the read entirely.
+
+    Reads directly from the address space to avoid the session read stack
+    (ReadValueId, ReadParameters, ServerItemCallback allocations per node).
     """
+    aspace = ua_server.iserver.aspace
     # Ordered list of (nodeid, node) for stable iteration
     node_list = [(node.nodeid, node) for _, node in ua_vars.items()]
     all_nodeids = frozenset(nid for nid, _ in node_list)
@@ -597,8 +601,15 @@ async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event, client_coun
             await asyncio.sleep(poll_interval)
             try:
                 for nodeid, node in node_list:
+                    # Read directly from address space – no session stack
                     try:
-                        current = await node.read_value_variant()
+                        ua_node = aspace.get(nodeid)
+                        if ua_node is None:
+                            continue
+                        attval = ua_node.attributes.get(ua.AttributeIds.Value)
+                        if attval is None or attval.value is None:
+                            continue
+                        current = attval.value.Value.Value
                     except Exception:
                         continue
 
@@ -665,10 +676,13 @@ async def _async_gc_loop(stop_event):
     """
     interval = 30  # seconds
     logger.info("Async GC loop started (interval=%ds)" % interval)
+    prev_counts = {}  # type name -> count, for tracking growth
     while not stop_event.is_set():
         await asyncio.sleep(interval)
         try:
             mem_before = get_memory_usage_mb()
+            # Count objects before GC to track what's accumulating
+            counts_before = _count_objects_by_type()
             # Run 3 GC passes to break reference cycles
             n1 = gc.collect()
             n2 = gc.collect()
@@ -682,6 +696,19 @@ async def _async_gc_loop(stop_event):
                     mem_before, mem_after, tag, total))
             else:
                 logger.info("Async GC: collected %d objects (psutil unavailable)" % total)
+
+            # Track object count growth for leak diagnosis
+            counts_after = _count_objects_by_type()
+            growing = []
+            for tname in counts_after:
+                before = prev_counts.get(tname, 0)
+                after = counts_after[tname]
+                delta = after - before
+                if delta > 10 and after > 50:  # meaningful growth
+                    growing.append(f"{tname}:{delta:+d}")
+            if growing:
+                logger.info("Object growth: %s" % ", ".join(sorted(growing, key=lambda x: -int(x.rsplit(':', 1)[1]))))
+            prev_counts = counts_after
         except asyncio.CancelledError:
             logger.info("Async GC loop cancelled")
             raise
