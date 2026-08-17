@@ -1,5 +1,6 @@
 # ---------------------------------------------------------------------------
 # Nuitka: add Qt DLL directories to search path before importing PyQt5
+# Works for both --onefile (extracts to temp dir) and --standalone modes
 # ---------------------------------------------------------------------------
 import ctypes
 import os
@@ -7,30 +8,72 @@ import sys
 
 if getattr(sys, 'frozen', False):
     # Running as Nuitka compiled binary
-    _base_path = os.path.dirname(os.path.abspath(sys.argv[0]))
-    _pyqt5_dir = os.path.join(_base_path, 'PyQt5')
-    _qt_dir = os.path.join(_base_path, 'Qt')
+    # For --onefile, sys._MEIPASS points to the extraction directory
+    # For --standalone, it points to the app directory
+    if hasattr(sys, '_MEIPASS'):
+        _base_path = sys._MEIPASS
+    else:
+        _base_path = os.path.dirname(os.path.abspath(sys.argv[0]))
+
+    # Find PyQt5 and Qt directories - try multiple possible locations
+    _qt_dir = None
+    _pyqt5_dir = None
+
+    # Nuitka onefile/standalone: PyQt5\qt-plugins, PyQt5\Qt5, etc.
+    _candidates = [
+        os.path.join(_base_path, 'PyQt5', 'Qt5'),
+        os.path.join(_base_path, 'PyQt5', 'Qt'),
+        os.path.join(_base_path, 'Qt'),
+        os.path.join(_base_path, 'Qt5'),
+    ]
+    for _c in _candidates:
+        if os.path.isdir(_c):
+            _qt_dir = _c
+            break
+
+    _pyqt5_candidates = [
+        os.path.join(_base_path, 'PyQt5'),
+    ]
+    for _c in _pyqt5_candidates:
+        if os.path.isdir(_c):
+            _pyqt5_dir = _c
+            break
 
     # Add to PATH
     _extra_paths = []
-    if os.path.isdir(_pyqt5_dir):
+    if _pyqt5_dir:
         _extra_paths.append(_pyqt5_dir)
-    if os.path.isdir(_qt_dir):
+    if _qt_dir:
+        _bin_dir = os.path.join(_qt_dir, 'bin')
+        if os.path.isdir(_bin_dir):
+            _extra_paths.append(_bin_dir)
         _extra_paths.append(_qt_dir)
     if _extra_paths:
         os.environ['PATH'] = os.pathsep.join(_extra_paths) + os.pathsep + os.environ.get('PATH', '')
 
     # Use SetDllDirectory as a fallback (Windows API)
-    try:
-        ctypes.windll.kernel32.SetDllDirectoryW(_qt_dir)
-    except AttributeError:
-        pass
+    if _qt_dir:
+        try:
+            ctypes.windll.kernel32.SetDllDirectoryW(_qt_dir)
+        except AttributeError:
+            pass
 
-    # Qt plugin path
-    _plugins_dir = os.path.join(_qt_dir, 'plugins')
-    if os.path.isdir(_plugins_dir):
+    # Qt plugin path - Nuitka puts them in PyQt5\qt-plugins for onefile
+    _plugins_dir = None
+    _plugin_candidates = [
+        os.path.join(_base_path, 'PyQt5', 'qt-plugins'),
+        os.path.join(_qt_dir, 'plugins') if _qt_dir else None,
+    ]
+    for _c in _plugin_candidates:
+        if _c and os.path.isdir(_c):
+            _plugins_dir = _c
+            break
+
+    if _plugins_dir:
         os.environ['QT_PLUGIN_PATH'] = _plugins_dir
-        os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = os.path.join(_plugins_dir, 'platforms')
+        _platforms_dir = os.path.join(_plugins_dir, 'platforms')
+        if os.path.isdir(_platforms_dir):
+            os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = _platforms_dir
 
 import asyncio
 import csv
@@ -466,9 +509,42 @@ async def _da_write_ua_batch_impl(ua_server, write_list):
         da_written_values[nid] = (val, time.monotonic())
 
 
+async def _da_write_ua_batch_direct_impl(ua_server, write_list):
+    """Execute a batch of writes by directly mutating the address space.
+
+    Bypasses asyncua's session-based write stack (write_value →
+    write_attribute → session.write) which allocates WriteValue,
+    WriteParameters, ServerItemCallback, and DataValue objects per tag
+    per cycle.  Instead we set the AttributeValue.value in place, which
+    is what the session write path ultimately does anyway.
+    """
+    aspace = ua_server.iserver.aspace
+    for node, val in write_list:
+        nid = node.nodeid
+        try:
+            ua_node = aspace.get(nid)
+            if ua_node is not None:
+                attval = ua_node.attributes.get(ua.AttributeIds.Value)
+                if attval is not None:
+                    variant = ua.Variant(val)
+                    attval.value = ua.DataValue(variant)
+                else:
+                    await node.write_value(val)
+            else:
+                await node.write_value(val)
+        except Exception as e:
+            logger.debug(f"Direct batch write error for {nid}: {e}")
+        da_written_values[nid] = (val, time.monotonic())
+
+
 def _da_write_ua_batch(write_list):
     """Schedule a batch of UA writes on the async loop as a single Future."""
     return asyncio.run_coroutine_threadsafe(_da_write_ua_batch_impl(ua_server_global, write_list), async_loop)
+
+
+def _da_write_ua_batch_direct(write_list):
+    """Schedule a batch of direct address-space writes on the async loop."""
+    return asyncio.run_coroutine_threadsafe(_da_write_ua_batch_direct_impl(ua_server_global, write_list), async_loop)
 
 
 async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event, client_count=None):
@@ -931,9 +1007,9 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                 except Exception as e:
                     raise
 
-                # Submit all writes as a single batch
+                # Submit all writes as a single batch (direct address space write)
                 if write_batch and async_loop:
-                    future = _da_write_ua_batch(write_batch)
+                    future = _da_write_ua_batch_direct(write_batch)
                     write_batch.clear()
                     try:
                         future.result(timeout=2.0)
@@ -953,9 +1029,9 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                             write_batch.append((node, val))
                         del tname, val, qual, ts
 
-                    # Submit batch
+                    # Submit batch (direct address space write)
                     if write_batch and async_loop:
-                        future = _da_write_ua_batch(write_batch)
+                        future = _da_write_ua_batch_direct(write_batch)
                         write_batch.clear()
                         try:
                             future.result(timeout=2.0)
