@@ -719,14 +719,17 @@ async def _reap_idle_sessions(ua_server):
                 continue
         for auth_token, session in to_close:
             try:
+                # asyncua's UaProcessor stores the client's peer address as
+                # `name` on the session at CreateSession time.
+                client_ip = session.name
                 logger.warning(
-                    "Reaping idle session %s (idle %.0fs > timeout %.0fs); "
+                    "Reaping idle session %s from %s (idle %.0fs > timeout %.0fs); "
                     "closing to release its subscriptions",
-                    session.name, now - session._last_activity, session.session_timeout,
+                    session.name, client_ip, now - session._last_activity, session.session_timeout,
                 )
                 await session.close_session(True)
             except Exception as e:
-                logger.warning(f"Error reaping session {session.name}: {e}")
+                logger.warning(f"Error reaping session {session.name} ({client_ip}): {e}")
     except Exception as e:
         logger.debug(f"Session reap error: {e}")
 
