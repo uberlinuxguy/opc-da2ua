@@ -675,6 +675,57 @@ def _prune_da_written_values(current_nodeids):
         logger.debug(f"Pruned {len(keys_to_remove)} stale entries from da_written_values")
 
 
+async def _reap_idle_sessions(ua_server):
+    """Close external OPC UA sessions that have been idle past their timeout.
+
+    asyncua keeps a session (and all of its subscriptions / monitored items)
+    alive after the client's TCP connection drops, per OPC UA Part 4 §6.7, so
+    the client can transfer/reactivate them. The session's own timeout
+    watchdog is supposed to close it after `session_timeout` of inactivity,
+    but in asyncua 2.x that watchdog task is not reliably scheduled, so
+    abandoned sessions leak: each one pins ~N monitored items (one per
+    subscribed tag) plus their DataValue/Variant/StatusCode objects and
+    address-space datachange callbacks.
+
+    This reaper is a safety net: it walks the server's external-session
+    registry and force-closes any session whose last activity is older than
+    its negotiated timeout (plus a small grace margin). Closing a session
+    deletes its subscriptions and monitored items, releasing the leak.
+    """
+    try:
+        iserver = ua_server.iserver
+        sessions = getattr(iserver, "_external_sessions", None)
+        if not sessions:
+            return
+        now = time.monotonic()
+        grace = 10.0  # seconds of extra tolerance beyond the negotiated timeout
+        to_close = []
+        for auth_token, session in list(sessions.items()):
+            try:
+                if session.state.name == "Closed":
+                    continue
+                timeout = session.session_timeout
+                last = getattr(session, "_last_activity", None)
+                if timeout is None or last is None:
+                    continue
+                if now - last > timeout + grace:
+                    to_close.append((auth_token, session))
+            except Exception:
+                continue
+        for auth_token, session in to_close:
+            try:
+                logger.warning(
+                    "Reaping idle session %s (idle %.0fs > timeout %.0fs); "
+                    "closing to release its subscriptions",
+                    session.name, now - session._last_activity, session.session_timeout,
+                )
+                await session.close_session(True)
+            except Exception as e:
+                logger.warning(f"Error reaping session {session.name}: {e}")
+    except Exception as e:
+        logger.debug(f"Session reap error: {e}")
+
+
 async def _async_gc_loop(stop_event):
     """Periodically run GC from within the async event loop.
 
@@ -688,6 +739,10 @@ async def _async_gc_loop(stop_event):
     while not stop_event.is_set():
         await asyncio.sleep(interval)
         try:
+            # Safety net: close abandoned client sessions before GC so their
+            # subscriptions / monitored items are released and collectable.
+            if ua_server_global is not None:
+                await _reap_idle_sessions(ua_server_global)
             mem_before = get_memory_usage_mb()
             # Count objects before GC to track what's accumulating
             counts_before = _count_objects_by_type()
