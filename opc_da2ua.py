@@ -551,8 +551,11 @@ async def _da_write_ua_batch_direct_impl(ua_server, write_list):
                 _node_variant_types[nid] = vtype
             dv = ua.DataValue(ua.Variant(val, vtype))
             await aspace.write_attribute_value(nid, ua.AttributeIds.Value, dv)
+            if not hasattr(_da_write_ua_batch_direct_impl, '_logged_first'):
+                _da_write_ua_batch_direct_impl._logged_first = True
+                logger.info(f"First UA write OK: {nid} = {val} (vtype={vtype})")
         except Exception as e:
-            logger.debug(f"Direct batch write error for {nid}: {e}")
+            logger.warning(f"Direct batch write error for {nid}: {e}")
         da_written_values[nid] = (val, time.monotonic())
 
 
