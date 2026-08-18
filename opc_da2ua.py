@@ -537,9 +537,17 @@ async def _da_write_ua_batch_direct_impl(ua_server, write_list):
     for node, val in write_list:
         nid = node.nodeid
         try:
+            # Use the node's existing variant type so the write matches the
+            # node's declared DataType (write_attribute_value rejects a
+            # mismatching variant type as BadTypeMismatch).
             vtype = _node_variant_types.get(nid)
             if vtype is None:
-                vtype = ua.Variant(val).VariantType
+                ua_node = aspace.get(nid)
+                attval = ua_node.attributes.get(ua.AttributeIds.Value) if ua_node else None
+                if attval is not None and attval.value is not None and attval.value.Value is not None:
+                    vtype = attval.value.Value.VariantType
+                else:
+                    vtype = ua.Variant(val).VariantType
                 _node_variant_types[nid] = vtype
             dv = ua.DataValue(ua.Variant(val, vtype))
             await aspace.write_attribute_value(nid, ua.AttributeIds.Value, dv)
