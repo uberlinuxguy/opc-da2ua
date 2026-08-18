@@ -1296,9 +1296,10 @@ class DAMonitorDialog(QDialog):
         self.resize(560, 320)
         self._server = server_name
         self._tag = tag
-        self._client = None
         self._row = 0
         self._max_rows = 200
+        self._stop = threading.Event()
+        self._result_queue = Queue()
 
         layout = QVBoxLayout(self)
 
@@ -1330,46 +1331,58 @@ class DAMonitorDialog(QDialog):
         btns.addWidget(close)
         layout.addLayout(btns)
 
-        # Connect to the DA server in a worker thread (COM init + connect can
-        # block for several seconds).
-        self._connect_thread = threading.Thread(target=self._connect_worker, daemon=True)
-        self._connect_thread.start()
+        # All COM work (connect + read) happens in ONE worker thread.
+        # COM objects are thread-affine; calling read() from a different
+        # thread than the one that created the client fails with
+        # OPC_E_BADSTARTINGVALUE. The worker pushes results to a queue;
+        # a QTimer on the GUI thread drains the queue and updates the table.
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
 
         self._timer = QTimer(self)
-        self._timer.timeout.connect(self._poll)
-        self._timer.start(500)
+        self._timer.timeout.connect(self._drain_queue)
+        self._timer.start(100)
 
-    def _connect_worker(self):
+    def _worker_loop(self):
+        """Runs in a dedicated thread. All COM calls happen here."""
         pythoncom.CoInitialize()
+        client = None
         try:
             client = OpenOPC.client()
             client.connect(self._server)
-            self._client = client
-            self.status_label.setText("Connected – polling…")
-            self.status_label.setStyleSheet("color: #2e7d32;")
+            self._result_queue.put(("status", "Connected – polling…", "#2e7d32"))
+            while not self._stop.is_set():
+                try:
+                    for tname, val, qual, ts in client.read(
+                        [self._tag], group="da_monitor", update=500
+                    ):
+                        self._result_queue.put(("row", val, qual, ts))
+                except Exception as e:
+                    self._result_queue.put(("status", f"Read error: {e}", "#c62828"))
+                # Sleep in small increments so stop is responsive
+                self._stop.wait(0.5)
         except Exception as e:
-            self._client = None
-            self.status_label.setText(f"Connect failed: {e}")
-            self.status_label.setStyleSheet("color: #c62828;")
+            self._result_queue.put(("status", f"Connect failed: {e}", "#c62828"))
         finally:
+            if client:
+                try:
+                    client.close()
+                except Exception:
+                    pass
             pythoncom.CoUninitialize()
 
-    def _poll(self):
-        client = self._client
-        if client is None:
-            return
+    def _drain_queue(self):
+        """GUI-thread timer: pull results from the worker and update the UI."""
         try:
-            # Pass a positive update rate (ms). OpenOPC sets
-            # DefaultGroupUpdateRate to this value before AddGroup().
-            # The default of -1 (infinite) is rejected by some servers
-            # with OPC_E_BADSTARTINGVALUE (0x80040201 / -2147220995).
-            for tname, val, qual, ts in client.read(
-                [self._tag], group="da_monitor", update=500
-            ):
-                self._append_row(val, qual, ts)
-        except Exception as e:
-            self.status_label.setText(f"Read error: {e}")
-            self.status_label.setStyleSheet("color: #c62828;")
+            while True:
+                msg = self._result_queue.get_nowait()
+                if msg[0] == "status":
+                    self.status_label.setText(msg[1])
+                    self.status_label.setStyleSheet(f"color: {msg[2]};")
+                elif msg[0] == "row":
+                    self._append_row(msg[1], msg[2], msg[3])
+        except Exception:
+            pass
 
     def _append_row(self, val, qual, ts):
         now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -1403,12 +1416,8 @@ class DAMonitorDialog(QDialog):
 
     def closeEvent(self, event):
         self._timer.stop()
-        if self._client:
-            try:
-                self._client.close()
-            except Exception:
-                pass
-            self._client = None
+        self._stop.set()
+        self._worker.join(timeout=3.0)
         super().closeEvent(event)
 
 
