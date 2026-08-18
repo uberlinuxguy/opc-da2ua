@@ -104,7 +104,7 @@ from PyQt5.QtWidgets import (
     QFileDialog, QMessageBox, QDialog, QFormLayout, QLineEdit,
     QGroupBox, QSplitter, QTextEdit, QToolBar, QStatusBar,
     QMenuBar, QMenu, QComboBox, QAbstractItemView, QInputDialog,
-    QAction, QRadioButton, QCheckBox,
+    QAction, QRadioButton, QCheckBox, QTableWidget, QTableWidgetItem,
 )
 from PyQt5.QtCore import Qt, pyqtSlot as Slot, QThread, QTimer, pyqtSignal as Signal
 from PyQt5.QtGui import QFont, QColor, QTextCursor
@@ -1280,6 +1280,132 @@ class EditTagDialog(QDialog):
         return self.tag_edit.text().strip()
 
 
+class DAMonitorDialog(QDialog):
+    """Live view of raw OPC DA values for a single tag.
+
+    Opens its own OPC DA connection (independent of the gateway worker) and
+    polls the tag on a timer. This is a diagnostic tool: it shows what the DA
+    server is actually returning, so you can tell whether missing data is on
+    the DA side or in the DA→UA bridge.
+    """
+
+    def __init__(self, server_name, tag, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setWindowTitle(f"DA Monitor – {tag}  [{server_name}]")
+        self.resize(560, 320)
+        self._server = server_name
+        self._tag = tag
+        self._client = None
+        self._row = 0
+        self._max_rows = 200
+
+        layout = QVBoxLayout(self)
+
+        header = QLabel(f"<b>{tag}</b> on <b>{server_name}</b>")
+        layout.addWidget(header)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Time", "Value", "Quality", "Source Timestamp"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+        layout.addWidget(self.table)
+
+        self.status_label = QLabel("Connecting…")
+        self.status_label.setStyleSheet("color: #c62828;")
+        layout.addWidget(self.status_label)
+
+        btns = QHBoxLayout()
+        self.btn_clear = QPushButton("Clear")
+        self.btn_clear.clicked.connect(self._clear)
+        btns.addWidget(self.btn_clear)
+        btns.addStretch()
+        close = QPushButton("Close")
+        close.clicked.connect(self.close)
+        btns.addWidget(close)
+        layout.addLayout(btns)
+
+        # Connect to the DA server in a worker thread (COM init + connect can
+        # block for several seconds).
+        self._connect_thread = threading.Thread(target=self._connect_worker, daemon=True)
+        self._connect_thread.start()
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._poll)
+        self._timer.start(500)
+
+    def _connect_worker(self):
+        pythoncom.CoInitialize()
+        try:
+            client = OpenOPC.client()
+            client.connect(self._server)
+            self._client = client
+            self.status_label.setText("Connected – polling…")
+            self.status_label.setStyleSheet("color: #2e7d32;")
+        except Exception as e:
+            self._client = None
+            self.status_label.setText(f"Connect failed: {e}")
+            self.status_label.setStyleSheet("color: #c62828;")
+        finally:
+            pythoncom.CoUninitialize()
+
+    def _poll(self):
+        client = self._client
+        if client is None:
+            return
+        try:
+            for tname, val, qual, ts in client.read([self._tag]):
+                self._append_row(val, qual, ts)
+        except Exception as e:
+            self.status_label.setText(f"Read error: {e}")
+            self.status_label.setStyleSheet("color: #c62828;")
+
+    def _append_row(self, val, qual, ts):
+        now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        ts_str = ""
+        if ts is not None:
+            try:
+                ts_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")[:-3]
+            except Exception:
+                ts_str = str(ts)
+        row = self._row
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(now))
+        self.table.setItem(row, 1, QTableWidgetItem(str(val)))
+        qitem = QTableWidgetItem(qual)
+        if qual == "Good":
+            qitem.setForeground(QColor("#2e7d32"))
+        else:
+            qitem.setForeground(QColor("#c62828"))
+        self.table.setItem(row, 2, qitem)
+        self.table.setItem(row, 3, QTableWidgetItem(ts_str))
+        self._row += 1
+        # Cap the number of rows to avoid unbounded growth
+        if self._row > self._max_rows:
+            self.table.removeRow(0)
+            self._row -= 1
+        self.table.scrollToBottom()
+
+    def _clear(self):
+        self.table.setRowCount(0)
+        self._row = 0
+
+    def closeEvent(self, event):
+        self._timer.stop()
+        if self._client:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            self._client = None
+        super().closeEvent(event)
+
+
 # ===================================================================
 # Preferences dialog
 # ===================================================================
@@ -1981,10 +2107,13 @@ class MainWindow(QMainWindow):
         self._refresh_tree()
 
     def _on_tree_double_click(self, item, column):
-        """Double-click a tag to edit it."""
-        if item.parent():
-            self.tree.setCurrentItem(item)
-            self._edit_tag()
+        """Double-click a tag to open the live DA monitor."""
+        # A tag item has two parents (folder → server); a folder has one.
+        if item.parent() and item.parent().parent():
+            srv_name = item.parent().parent().text(0)
+            tag = item.text(0)
+            dlg = DAMonitorDialog(srv_name, tag, self)
+            dlg.show()
 
     # ------------------------------------------------------------------
     # Gateway start / stop
