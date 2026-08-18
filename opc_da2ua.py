@@ -536,6 +536,9 @@ async def _da_write_ua_batch_direct_impl(ua_server, write_list):
     aspace = ua_server.iserver.aspace
     for node, val in write_list:
         nid = node.nodeid
+        # Record the write BEFORE writing so the UA write monitor doesn't
+        # mistake it for an external client write (race condition).
+        da_written_values[nid] = (val, time.monotonic())
         try:
             # Use the node's existing variant type so the write matches the
             # node's declared DataType (write_attribute_value rejects a
@@ -556,7 +559,6 @@ async def _da_write_ua_batch_direct_impl(ua_server, write_list):
                 logger.info(f"First UA write OK: {nid} = {val} (vtype={vtype})")
         except Exception as e:
             logger.warning(f"Direct batch write error for {nid}: {e}")
-        da_written_values[nid] = (val, time.monotonic())
 
 
 def _da_write_ua_batch(write_list):
@@ -631,6 +633,7 @@ async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event, client_coun
                     # Only forward if value changed (external UA client write)
                     if current != prev:
                         last_values[nodeid] = current
+                        logger.info(f"Write monitor: routing external write {nodeid} = {current} → DA")
                         handler.route_write(nodeid, current)
             except asyncio.CancelledError:
                 raise
