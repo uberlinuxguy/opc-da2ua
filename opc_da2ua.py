@@ -1359,11 +1359,13 @@ class DAMonitorDialog(QDialog):
         if client is None:
             return
         try:
-            # Use a named group so OpenOPC creates it with proper defaults.
-            # A bare read() (no group) creates a group with starting value 0
-            # (deadband), which some servers reject with OPC_E_BADSTARTINGVALUE
-            # (0x80040201 / -2147220995).
-            for tname, val, qual, ts in client.read([self._tag], group="da_monitor"):
+            # Pass a positive update rate (ms). OpenOPC sets
+            # DefaultGroupUpdateRate to this value before AddGroup().
+            # The default of -1 (infinite) is rejected by some servers
+            # with OPC_E_BADSTARTINGVALUE (0x80040201 / -2147220995).
+            for tname, val, qual, ts in client.read(
+                [self._tag], group="da_monitor", update=500
+            ):
                 self._append_row(val, qual, ts)
         except Exception as e:
             self.status_label.setText(f"Read error: {e}")
