@@ -1103,16 +1103,26 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                 # update= sets the group's update rate (ms) when the group is
                 # first created; it is ignored on subsequent reads.
                 write_batch = []
+                read_count = 0
                 try:
                     for tname, val, qual, ts in da_client.read(tags, group=f"{server_name}_sub", update=int(poll_interval * 1000)):
+                        read_count += 1
                         if qual == "Good":
-                            node = ua_variables[tname]
-                            write_batch.append((node, val))
+                            node = ua_variables.get(tname)
+                            if node is not None:
+                                write_batch.append((node, val))
+                            else:
+                                logger.warning(f"[{server_name}] tag '{tname}' not in ua_variables (have {len(ua_variables)} tags)")
                         elif qual != "Good":
                             logger.debug(f"[{server_name}] tag {tname} quality: {qual}")
                         del tname, val, qual, ts
                 except Exception as e:
                     raise
+
+                # Diagnostic: log the first few reads to see what's coming back
+                if read_count > 0 and not hasattr(_opc_da_worker_loop, f'_sub_logged_{server_name}'):
+                    setattr(_opc_da_worker_loop, f'_sub_logged_{server_name}', True)
+                    logger.info(f"[{server_name}] subscription read returned {read_count} item(s), {len(write_batch)} Good → writing")
 
                 # Submit all writes as a single batch (direct address space write)
                 if write_batch and async_loop:
