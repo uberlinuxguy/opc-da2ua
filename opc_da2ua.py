@@ -1,5 +1,6 @@
 # ---------------------------------------------------------------------------
-# Nuitka: add Qt DLL directories to search path before importing PySide2
+# Nuitka: add Qt DLL directories to search path before importing PyQt5
+# Works for both --onefile (extracts to temp dir) and --standalone modes
 # ---------------------------------------------------------------------------
 import ctypes
 import os
@@ -7,30 +8,72 @@ import sys
 
 if getattr(sys, 'frozen', False):
     # Running as Nuitka compiled binary
-    _base_path = os.path.dirname(os.path.abspath(sys.argv[0]))
-    _pyside2_dir = os.path.join(_base_path, 'PySide2')
-    _shiboken2_dir = os.path.join(_base_path, 'shiboken2')
+    # For --onefile, sys._MEIPASS points to the extraction directory
+    # For --standalone, it points to the app directory
+    if hasattr(sys, '_MEIPASS'):
+        _base_path = sys._MEIPASS
+    else:
+        _base_path = os.path.dirname(os.path.abspath(sys.argv[0]))
+
+    # Find PyQt5 and Qt directories - try multiple possible locations
+    _qt_dir = None
+    _pyqt5_dir = None
+
+    # Nuitka onefile/standalone: PyQt5\qt-plugins, PyQt5\Qt5, etc.
+    _candidates = [
+        os.path.join(_base_path, 'PyQt5', 'Qt5'),
+        os.path.join(_base_path, 'PyQt5', 'Qt'),
+        os.path.join(_base_path, 'Qt'),
+        os.path.join(_base_path, 'Qt5'),
+    ]
+    for _c in _candidates:
+        if os.path.isdir(_c):
+            _qt_dir = _c
+            break
+
+    _pyqt5_candidates = [
+        os.path.join(_base_path, 'PyQt5'),
+    ]
+    for _c in _pyqt5_candidates:
+        if os.path.isdir(_c):
+            _pyqt5_dir = _c
+            break
 
     # Add to PATH
     _extra_paths = []
-    if os.path.isdir(_pyside2_dir):
-        _extra_paths.append(_pyside2_dir)
-    if os.path.isdir(_shiboken2_dir):
-        _extra_paths.append(_shiboken2_dir)
+    if _pyqt5_dir:
+        _extra_paths.append(_pyqt5_dir)
+    if _qt_dir:
+        _bin_dir = os.path.join(_qt_dir, 'bin')
+        if os.path.isdir(_bin_dir):
+            _extra_paths.append(_bin_dir)
+        _extra_paths.append(_qt_dir)
     if _extra_paths:
         os.environ['PATH'] = os.pathsep.join(_extra_paths) + os.pathsep + os.environ.get('PATH', '')
 
     # Use SetDllDirectory as a fallback (Windows API)
-    try:
-        ctypes.windll.kernel32.SetDllDirectoryW(_pyside2_dir)
-    except AttributeError:
-        pass
+    if _qt_dir:
+        try:
+            ctypes.windll.kernel32.SetDllDirectoryW(_qt_dir)
+        except AttributeError:
+            pass
 
-    # Qt plugin path
-    _plugins_dir = os.path.join(_pyside2_dir, 'plugins')
-    if os.path.isdir(_plugins_dir):
+    # Qt plugin path - Nuitka puts them in PyQt5\qt-plugins for onefile
+    _plugins_dir = None
+    _plugin_candidates = [
+        os.path.join(_base_path, 'PyQt5', 'qt-plugins'),
+        os.path.join(_qt_dir, 'plugins') if _qt_dir else None,
+    ]
+    for _c in _plugin_candidates:
+        if _c and os.path.isdir(_c):
+            _plugins_dir = _c
+            break
+
+    if _plugins_dir:
         os.environ['QT_PLUGIN_PATH'] = _plugins_dir
-        os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = os.path.join(_plugins_dir, 'platforms')
+        _platforms_dir = os.path.join(_plugins_dir, 'platforms')
+        if os.path.isdir(_platforms_dir):
+            os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = _platforms_dir
 
 import asyncio
 import csv
@@ -55,16 +98,16 @@ except ImportError:
 import OpenOPC
 import pythoncom
 from asyncua.server.server import Server, ua
-from PySide2.QtWidgets import (
+from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTreeWidget, QTreeWidgetItem, QHeaderView, QPushButton, QLabel,
     QFileDialog, QMessageBox, QDialog, QFormLayout, QLineEdit,
     QGroupBox, QSplitter, QTextEdit, QToolBar, QStatusBar,
     QMenuBar, QMenu, QComboBox, QAbstractItemView, QInputDialog,
-    QAction, QRadioButton, QCheckBox,
+    QAction, QRadioButton, QCheckBox, QTableWidget, QTableWidgetItem,
 )
-from PySide2.QtCore import Qt, Slot, QThread, QTimer, Signal
-from PySide2.QtGui import QFont, QColor, QTextCursor
+from PyQt5.QtCore import Qt, pyqtSlot as Slot, QThread, QTimer, pyqtSignal as Signal
+from PyQt5.QtGui import QFont, QColor, QTextCursor
 
 # ---------------------------------------------------------------------------
 # Custom logging – routes to file + Qt log pane
@@ -117,6 +160,12 @@ def setup_logging(level=logging.INFO, log_file="gateway.log"):
 qthandler = setup_logging()
 logger = logging.getLogger("OPC_MultiServer_Gateway")
 
+# Custom log level for memory profiling / GC diagnostics. Sits between INFO
+# (20) and WARNING (30) so these messages are hidden at the default INFO
+# level and only appear when verbose logging is enabled.
+VERBOSE = 15
+logging.addLevelName(VERBOSE, "VERBOSE")
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -132,7 +181,9 @@ DEFAULT_REINIT_INTERVAL = 5400.0  # 1.5 hours in seconds
 
 write_queues = {}
 async_loop = None
+ua_server_global = None  # Global reference to the asyncua Server for batch writes
 da_written_values = {}  # Shared dict: nodeid -> value, updated by DA worker to suppress echo writes
+_node_variant_types = {}  # nodeid -> VariantType, cached to skip _guess_type() per write
 CERT_FILE = "server_cert.pem"
 KEY_FILE = "server_key.pem"
 
@@ -143,6 +194,7 @@ KEY_FILE = "server_key.pem"
 PREFERENCES_FILE = "gateway_prefs.json"
 DEFAULT_LOG_FILE = "gateway.log"
 DEFAULT_LOG_LEVEL = "INFO"
+VERBOSE_LOG_LEVEL = "VERBOSE"  # INFO + asyncua per-request tracing
 DEFAULT_SSL_ENABLED = False
 DEFAULT_CHUNK_SIZE_PREF = DEFAULT_CHUNK_SIZE
 DEFAULT_POLL_INTERVAL_PREF = DEFAULT_POLL_INTERVAL
@@ -155,6 +207,7 @@ def load_preferences():
     prefs = {
         "log_level": DEFAULT_LOG_LEVEL,
         "log_file": DEFAULT_LOG_FILE,
+        "verbose_asyncua": False,
         "ssl_enabled": DEFAULT_SSL_ENABLED,
         "chunk_size": DEFAULT_CHUNK_SIZE_PREF,
         "poll_interval": DEFAULT_POLL_INTERVAL_PREF,
@@ -184,7 +237,7 @@ def apply_preferences(prefs=None):
         prefs = load_preferences()
 
     level_str = prefs.get("log_level", DEFAULT_LOG_LEVEL).upper()
-    level_map = {"INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR}
+    level_map = {"INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR, "VERBOSE": VERBOSE}
     level = level_map.get(level_str, logging.INFO)
 
     log_file = prefs.get("log_file", DEFAULT_LOG_FILE)
@@ -216,7 +269,18 @@ def apply_preferences(prefs=None):
     qthandler.setLevel(level)
     root.addHandler(qthandler)
 
-    logger.info(f"Logging configured: level={level_str}, file={log_file}")
+    # asyncua logs every protocol request (Browse/Read/Write/Subscribe...) at
+    # INFO level, which floods the log when a client browses the address space.
+    # Keep it at WARNING unless verbose tracing is explicitly enabled.
+    verbose = bool(prefs.get("verbose_asyncua", False)) or level_str == VERBOSE_LOG_LEVEL
+    logging.getLogger("asyncua").setLevel(logging.DEBUG if verbose else logging.WARNING)
+
+    # asyncua logs incoming connections ("New connection from ...") at INFO
+    # level, but the logger above is capped at WARNING. Keep the binary
+    # transport logger at INFO so client IPs are always recorded.
+    logging.getLogger("asyncua.server.binary_server_asyncio").setLevel(logging.INFO)
+
+    logger.info(f"Logging configured: level={level_str}, file={log_file}, asyncua={'verbose' if verbose else 'quiet'}")
 
 
 # ===================================================================
@@ -263,6 +327,7 @@ class GatewayEngine(QThread):
             self._async_loop = None
 
     async def _async_main(self):
+        global ua_server_global
         if not self.config:
             self.log_signal.emit("No servers configured – add servers to start.")
             return
@@ -348,19 +413,25 @@ class GatewayEngine(QThread):
         self._client_count = {'count': 0}
         # Log memory usage after setup
         log_memory_usage(logger, "gateway-start")
-        # Start a background monitor for UA write requests (asyncua 1.1.0 lacks
+
+        # Start a background monitor for UA write requests (asyncua lacks
         # set_data_value_callback, so we poll the variables for external writes)
         self._write_monitor_task = asyncio.create_task(
             _ua_write_monitor(ua_server, ua_vars, handler, self._stop_event, self._client_count)
         )
+        logger.info("Write monitor task created")
+
         # Start periodic async GC to clean up event loop internal references
         self._async_gc_task = asyncio.create_task(
             _async_gc_loop(self._stop_event)
         )
+        logger.info("Async GC task created")
         msg = "OPC UA Gateway is up and running on " + OPC_UA_ENDPOINT
         logger.info(msg)
         self.log_signal.emit(msg)
         self._ua_server = ua_server
+        global ua_server_global
+        ua_server_global = ua_server
 
         async with ua_server:
             while not self._stop_event.is_set():
@@ -405,7 +476,10 @@ class GatewayEngine(QThread):
         for srv in self._server_names:
             write_queues.pop(srv, None)
         da_written_values.clear()
+        _node_variant_types.clear()
         self._server_names.clear()
+        
+        ua_server_global = None
         logger.debug("Gateway engine cleanup complete")
         log_memory_usage(logger, "gateway-stop")
 
@@ -445,23 +519,70 @@ async def _da_write_ua(node, val):
     da_written_values[node.nodeid] = (val, time.monotonic())
 
 
-async def _da_write_ua_batch_impl(write_list):
-    """Execute a batch of writes inside the async loop (single Future).
-
-    Uses set_attribute_value on the address space node directly to avoid
-    the high-level write_value() wrapper object churn (Variant/DataValue/
-    WriteValue/Response objects created per-tag per-cycle).
-    """
+async def _da_write_ua_batch_impl(ua_server, write_list):
+    """Execute a batch of writes inside the async loop (single Future)."""
     for node, val in write_list:
         nid = node.nodeid
-        # Direct address space write - minimal object allocation
-        await node.write_value(val)
+        try:
+            await node.write_value(val)
+        except Exception as e:
+            logger.debug(f"Batch write error for {nid}: {e}")
         da_written_values[nid] = (val, time.monotonic())
+
+
+async def _da_write_ua_batch_direct_impl(ua_server, write_list):
+    """Execute a batch of writes via the address space write path.
+
+    Uses aspace.write_attribute_value() so that datachange_callbacks are
+    invoked and UA subscribers receive real-time notifications.  This is
+    lighter than the full session-based write stack (write_value →
+    write_attribute → session.write) which allocates WriteValue,
+    WriteParameters, and ServerItemCallback objects per tag per cycle.
+    """
+    aspace = ua_server.iserver.aspace
+    count = 0
+    for node, val in write_list:
+        nid = node.nodeid
+        # Record the write BEFORE writing so the UA write monitor doesn't
+        # mistake it for an external client write (race condition).
+        da_written_values[nid] = (val, time.monotonic())
+        try:
+            # Use the node's existing variant type so the write matches the
+            # node's declared DataType (write_attribute_value rejects a
+            # mismatching variant type as BadTypeMismatch).
+            vtype = _node_variant_types.get(nid)
+            if vtype is None:
+                ua_node = aspace.get(nid)
+                attval = ua_node.attributes.get(ua.AttributeIds.Value) if ua_node else None
+                if attval is not None and attval.value is not None and attval.value.Value is not None:
+                    vtype = attval.value.Value.VariantType
+                else:
+                    vtype = ua.Variant(val).VariantType
+                _node_variant_types[nid] = vtype
+            dv = ua.DataValue(ua.Variant(val, vtype))
+            status = await aspace.write_attribute_value(nid, ua.AttributeIds.Value, dv)
+            if not status.is_good():
+                logger.warning(f"UA write rejected for {nid}: {status}")
+        except Exception as e:
+            logger.warning(f"Direct batch write error for {nid}: {e}")
+        # Yield to the event loop periodically. A 5,889-tag batch otherwise
+        # runs as one long uninterrupted chunk (the datachange callbacks
+        # mostly complete without suspending), starving the loop so UA
+        # clients can't get Browse/Read/Publish serviced and their sessions
+        # time out. Yielding every 250 writes keeps the loop responsive.
+        count += 1
+        if count % 250 == 0:
+            await asyncio.sleep(0)
 
 
 def _da_write_ua_batch(write_list):
     """Schedule a batch of UA writes on the async loop as a single Future."""
-    return asyncio.run_coroutine_threadsafe(_da_write_ua_batch_impl(write_list), async_loop)
+    return asyncio.run_coroutine_threadsafe(_da_write_ua_batch_impl(ua_server_global, write_list), async_loop)
+
+
+def _da_write_ua_batch_direct(write_list):
+    """Schedule a batch of direct address-space writes on the async loop."""
+    return asyncio.run_coroutine_threadsafe(_da_write_ua_batch_direct_impl(ua_server_global, write_list), async_loop)
 
 
 async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event, client_count=None):
@@ -469,7 +590,11 @@ async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event, client_coun
 
     Only polls when there are connected UA clients. When no clients are
     connected, there's nothing to detect so we skip the read entirely.
+
+    Reads directly from the address space to avoid the session read stack
+    (ReadValueId, ReadParameters, ServerItemCallback allocations per node).
     """
+    aspace = ua_server.iserver.aspace
     # Ordered list of (nodeid, node) for stable iteration
     node_list = [(node.nodeid, node) for _, node in ua_vars.items()]
     all_nodeids = frozenset(nid for nid, _ in node_list)
@@ -495,9 +620,20 @@ async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event, client_coun
         if has_clients:
             await asyncio.sleep(poll_interval)
             try:
-                for nodeid, node in node_list:
+                for i, (nodeid, node) in enumerate(node_list):
+                    # Yield periodically so the loop stays responsive to
+                    # client requests while scanning thousands of nodes.
+                    if i % 500 == 0:
+                        await asyncio.sleep(0)
+                    # Read directly from address space – no session stack
                     try:
-                        current = await node.read_value_variant()
+                        ua_node = aspace.get(nodeid)
+                        if ua_node is None:
+                            continue
+                        attval = ua_node.attributes.get(ua.AttributeIds.Value)
+                        if attval is None or attval.value is None:
+                            continue
+                        current = attval.value.Value.Value
                     except Exception:
                         continue
 
@@ -515,6 +651,7 @@ async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event, client_coun
                     # Only forward if value changed (external UA client write)
                     if current != prev:
                         last_values[nodeid] = current
+                        logger.info(f"Write monitor: routing external write {nodeid} = {current} → DA")
                         handler.route_write(nodeid, current)
             except asyncio.CancelledError:
                 raise
@@ -555,6 +692,60 @@ def _prune_da_written_values(current_nodeids):
         logger.debug(f"Pruned {len(keys_to_remove)} stale entries from da_written_values")
 
 
+async def _reap_idle_sessions(ua_server):
+    """Close external OPC UA sessions that have been idle past their timeout.
+
+    asyncua keeps a session (and all of its subscriptions / monitored items)
+    alive after the client's TCP connection drops, per OPC UA Part 4 §6.7, so
+    the client can transfer/reactivate them. The session's own timeout
+    watchdog is supposed to close it after `session_timeout` of inactivity,
+    but in asyncua 2.x that watchdog task is not reliably scheduled, so
+    abandoned sessions leak: each one pins ~N monitored items (one per
+    subscribed tag) plus their DataValue/Variant/StatusCode objects and
+    address-space datachange callbacks.
+
+    This reaper is a safety net: it walks the server's external-session
+    registry and force-closes any session whose last activity is older than
+    its negotiated timeout (plus a small grace margin). Closing a session
+    deletes its subscriptions and monitored items, releasing the leak.
+    """
+    try:
+        iserver = ua_server.iserver
+        sessions = getattr(iserver, "_external_sessions", None)
+        if not sessions:
+            return
+        now = time.monotonic()
+        grace = 10.0  # seconds of extra tolerance beyond the negotiated timeout
+        to_close = []
+        for auth_token, session in list(sessions.items()):
+            try:
+                if session.state.name == "Closed":
+                    continue
+                timeout = session.session_timeout
+                last = getattr(session, "_last_activity", None)
+                if timeout is None or last is None:
+                    continue
+                if now - last > timeout + grace:
+                    to_close.append((auth_token, session))
+            except Exception:
+                continue
+        for auth_token, session in to_close:
+            try:
+                # asyncua's UaProcessor stores the client's peer address as
+                # `name` on the session at CreateSession time.
+                client_ip = session.name
+                logger.warning(
+                    "Reaping idle session %s from %s (idle %.0fs > timeout %.0fs); "
+                    "closing to release its subscriptions",
+                    session.name, client_ip, now - session._last_activity, session.session_timeout,
+                )
+                await session.close_session(True)
+            except Exception as e:
+                logger.warning(f"Error reaping session {session.name} ({client_ip}): {e}")
+    except Exception as e:
+        logger.debug(f"Session reap error: {e}")
+
+
 async def _async_gc_loop(stop_event):
     """Periodically run GC from within the async event loop.
 
@@ -562,24 +753,53 @@ async def _async_gc_loop(stop_event):
     Future internals, and asyncua objects that synchronous GC can't easily
     reach. Running GC from within the loop context helps release these.
     """
-    interval = 30  # seconds (more frequent for aggressive leak mitigation)
+    interval = 30  # seconds
+    logger.log(VERBOSE, "Async GC loop started (interval=%ds)" % interval)
+    prev_counts = {}  # type name -> count, for tracking growth
+    loop = asyncio.get_running_loop()
     while not stop_event.is_set():
         await asyncio.sleep(interval)
         try:
+            # Safety net: close abandoned client sessions before GC so their
+            # subscriptions / monitored items are released and collectable.
+            if ua_server_global is not None:
+                await _reap_idle_sessions(ua_server_global)
             mem_before = get_memory_usage_mb()
-            # Run 3 GC passes to break reference cycles
-            n1 = gc.collect()
-            n2 = gc.collect()
-            n3 = gc.collect()
+            # Run the blocking GC work in a thread-pool executor. gc.collect()
+            # and the object census are synchronous and can take well over a
+            # second with 100k+ live objects; running them on the event loop
+            # thread stalls it and causes UA client sessions to time out.
+            counts_before = await loop.run_in_executor(None, _count_objects_by_type)
+            n1 = await loop.run_in_executor(None, gc.collect)
+            n2 = await loop.run_in_executor(None, gc.collect)
+            n3 = await loop.run_in_executor(None, gc.collect)
+            total = n1 + n2 + n3
             mem_after = get_memory_usage_mb()
             if mem_before is not None and mem_after is not None:
                 freed = mem_before - mem_after
-                tag = f"+{freed:.1f}" if freed > 0 else f"{freed:.1f}"
-                logger.info(f"Async GC: {mem_before:.1f} MB -> {mem_after:.1f} MB ({tag} MB), collected {n1+n2+n3} objects")
+                tag = "+%.1f" % freed if freed > 0 else "%.1f" % freed
+                logger.log(VERBOSE, "Async GC: %.1f MB -> %.1f MB (%s MB), collected %d objects" % (
+                    mem_before, mem_after, tag, total))
+            else:
+                logger.log(VERBOSE, "Async GC: collected %d objects (psutil unavailable)" % total)
+
+            # Track object count growth for leak diagnosis
+            counts_after = await loop.run_in_executor(None, _count_objects_by_type)
+            growing = []
+            for tname in counts_after:
+                before = prev_counts.get(tname, 0)
+                after = counts_after[tname]
+                delta = after - before
+                if delta > 10 and after > 50:  # meaningful growth
+                    growing.append(f"{tname}:{delta:+d}")
+            if growing:
+                logger.log(VERBOSE, "Object growth: %s" % ", ".join(sorted(growing, key=lambda x: -int(x.rsplit(':', 1)[1]))))
+            prev_counts = counts_after
         except asyncio.CancelledError:
+            logger.log(VERBOSE, "Async GC loop cancelled")
             raise
         except Exception as e:
-            logger.debug(f"Async GC error: {e}")
+            logger.log(VERBOSE, f"Async GC error: {e}")
 
 
 def _interruptible_sleep(duration, stop_event=None):
@@ -611,7 +831,7 @@ def log_memory_usage(logger, tag=""):
     mem_mb = get_memory_usage_mb()
     if mem_mb is not None:
         tag_str = f" [{tag}]" if tag else ""
-        logger.info(f"Memory usage{tag_str}: {mem_mb:.1f} MB")
+        logger.log(VERBOSE, f"Memory usage{tag_str}: {mem_mb:.1f} MB")
 
 
 def _count_objects_by_type():
@@ -789,15 +1009,10 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
     log_memory_usage(logger, server_name)
 
     def cleanup_subscription():
-        """Safely unsubscribe and clean up subscription state."""
-        nonlocal subscribed, da_client
-        if subscribed and da_client:
-            try:
-                da_client.unsubscribe(tags)
-                logger.info(f"[{server_name}] unsubscribed from {len(tags)} tags")
-            except Exception as e:
-                logger.warning(f"[{server_name}] unsubscribe error: {e}")
-            subscribed = False
+        """Reset subscription state. OpenOPC manages OPC DA groups internally;
+        closing the client (done in cleanup_connection) removes the groups."""
+        nonlocal subscribed
+        subscribed = False
 
     def cleanup_connection():
         """Safely close the DA connection and reset state."""
@@ -841,7 +1056,9 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
             gc.collect()
             mem_after = get_memory_usage_mb()
             if mem_before is not None and mem_after is not None:
-                logger.info(f"[{server_name}] GC: {mem_before:.1f} MB → {mem_after:.1f} MB (freed {mem_before - mem_after:.1f} MB)")
+                freed = mem_before - mem_after
+                if freed > 0.5:  # only log if meaningful amount freed
+                    logger.log(VERBOSE, f"[{server_name}] GC: {mem_before:.1f} MB → {mem_after:.1f} MB (freed {freed:.1f} MB)")
             last_gc_time = now
 
         # Check if it's time for periodic reinitialization
@@ -873,15 +1090,18 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                 last_reinit_time = time.monotonic()
                 logger.info(f"Connected to [{server_name}]")
 
-                # Subscribe if using subscription mode
+                # Subscription mode: OpenOPC creates the OPC DA group on the
+                # first read() call; the update rate is set via the update=
+                # argument at that time (see subscription read below).
                 if da_mode == "subscription":
+                    # Remove any stale subscription group so the first read()
+                    # recreates it with the current update rate.
                     try:
-                        da_client.subscribe(tags, poll_interval * 1000)
-                        subscribed = True
-                        logger.info(f"[{server_name}] subscribed to {len(tags)} tags (interval={poll_interval}s)")
+                        da_client.remove([f"{server_name}_sub"])
                     except Exception as e:
-                        logger.warning(f"[{server_name}] subscription failed ({e}), falling back to polling")
-                        subscribed = False
+                        logger.debug(f"[{server_name}] group remove before subscribe: {e}")
+                    subscribed = True
+                    logger.info(f"[{server_name}] subscription mode enabled (interval={poll_interval}s)")
 
             except Exception as e:
                 logger.error(f"Connect [{server_name}] failed: {e}")
@@ -903,26 +1123,32 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                 my_queue.task_done()
 
             if da_mode == "subscription" and subscribed:
-                # Subscription mode – read returns only changed values
+                # Subscription mode – read returns only changed values.
+                # update= sets the group's update rate (ms) when the group is
+                # first created; it is ignored on subsequent reads.
                 write_batch = []
                 try:
-                    for tname, val, qual, ts in da_client.read(tags):
+                    for tname, val, qual, ts in da_client.read(tags, group=f"{server_name}_sub", update=int(poll_interval * 1000)):
                         if qual == "Good":
-                            node = ua_variables[tname]
-                            write_batch.append((node, val))
+                            node = ua_variables.get(tname)
+                            if node is not None:
+                                write_batch.append((node, val))
+                            else:
+                                logger.warning(f"[{server_name}] tag '{tname}' not in ua_variables (have {len(ua_variables)} tags)")
                         elif qual != "Good":
                             logger.debug(f"[{server_name}] tag {tname} quality: {qual}")
-                        # Explicitly release COM references from the tuple
                         del tname, val, qual, ts
                 except Exception as e:
                     raise
 
-                # Submit all writes as a single batch
+                # Submit all writes as a single batch (direct address space write).
+                # Pass a COPY of the list: the coroutine iterates it on the
+                # event-loop thread, so clearing write_batch here would race
+                # with the iteration and silently drop most of the tags.
                 if write_batch and async_loop:
-                    future = _da_write_ua_batch(write_batch)
-                    write_batch.clear()
+                    future = _da_write_ua_batch_direct(list(write_batch))
                     try:
-                        future.result(timeout=2.0)
+                        future.result(timeout=5.0)
                     except Exception as e:
                         logger.warning(f"[{server_name}] batch write error: {e}")
                     finally:
@@ -931,21 +1157,21 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                 time.sleep(max(poll_interval / 10, 0.05))
             else:
                 # Polling mode – read all tags in chunks and batch writes
-                for chunk in chunks:
+                for ci, chunk in enumerate(chunks):
                     write_batch = []
-                    for tname, val, qual, ts in da_client.read(chunk):
+                    for tname, val, qual, ts in da_client.read(chunk, group=f"{server_name}_g{ci}"):
                         if qual == "Good":
                             node = ua_variables[tname]
                             write_batch.append((node, val))
-                        # Explicitly release COM references
                         del tname, val, qual, ts
 
-                    # Submit batch
+                    # Submit batch (direct address space write). Pass a COPY:
+                    # the coroutine iterates it on the event-loop thread, so
+                    # mutating write_batch here would race with the iteration.
                     if write_batch and async_loop:
-                        future = _da_write_ua_batch(write_batch)
-                        write_batch.clear()
+                        future = _da_write_ua_batch_direct(list(write_batch))
                         try:
-                            future.result(timeout=2.0)
+                            future.result(timeout=5.0)
                         except Exception as e:
                             logger.warning(f"[{server_name}] batch write error: {e}")
                         finally:
@@ -1087,6 +1313,147 @@ class EditTagDialog(QDialog):
         return self.tag_edit.text().strip()
 
 
+class DAMonitorDialog(QDialog):
+    """Live view of raw OPC DA values for a single tag.
+
+    Opens its own OPC DA connection (independent of the gateway worker) and
+    polls the tag on a timer. This is a diagnostic tool: it shows what the DA
+    server is actually returning, so you can tell whether missing data is on
+    the DA side or in the DA→UA bridge.
+    """
+
+    def __init__(self, server_name, tag, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setWindowTitle(f"DA Monitor – {tag}  [{server_name}]")
+        self.resize(560, 320)
+        self._server = server_name
+        self._tag = tag
+        self._row = 0
+        self._max_rows = 200
+        self._stop = threading.Event()
+        self._result_queue = Queue()
+
+        layout = QVBoxLayout(self)
+
+        header = QLabel(f"<b>{tag}</b> on <b>{server_name}</b>")
+        layout.addWidget(header)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Time", "Value", "Quality", "Source Timestamp"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+        layout.addWidget(self.table)
+
+        self.status_label = QLabel("Connecting…")
+        self.status_label.setStyleSheet("color: #c62828;")
+        layout.addWidget(self.status_label)
+
+        btns = QHBoxLayout()
+        self.btn_clear = QPushButton("Clear")
+        self.btn_clear.clicked.connect(self._clear)
+        btns.addWidget(self.btn_clear)
+        btns.addStretch()
+        close = QPushButton("Close")
+        close.clicked.connect(self.close)
+        btns.addWidget(close)
+        layout.addLayout(btns)
+
+        # All COM work (connect + read) happens in ONE worker thread.
+        # COM objects are thread-affine; calling read() from a different
+        # thread than the one that created the client fails with
+        # OPC_E_BADSTARTINGVALUE. The worker pushes results to a queue;
+        # a QTimer on the GUI thread drains the queue and updates the table.
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._drain_queue)
+        self._timer.start(100)
+
+    def _worker_loop(self):
+        """Runs in a dedicated thread. All COM calls happen here."""
+        pythoncom.CoInitialize()
+        client = None
+        try:
+            client = OpenOPC.client()
+            client.connect(self._server)
+            self._result_queue.put(("status", "Connected – polling…", "#2e7d32"))
+            while not self._stop.is_set():
+                try:
+                    for tname, val, qual, ts in client.read(
+                        [self._tag], group="da_monitor", update=500
+                    ):
+                        self._result_queue.put(("row", val, qual, ts))
+                except Exception as e:
+                    self._result_queue.put(("status", f"Read error: {e}", "#c62828"))
+                # Sleep in small increments so stop is responsive
+                self._stop.wait(0.5)
+        except Exception as e:
+            self._result_queue.put(("status", f"Connect failed: {e}", "#c62828"))
+        finally:
+            if client:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            pythoncom.CoUninitialize()
+
+    def _drain_queue(self):
+        """GUI-thread timer: pull results from the worker and update the UI."""
+        try:
+            while True:
+                msg = self._result_queue.get_nowait()
+                if msg[0] == "status":
+                    self.status_label.setText(msg[1])
+                    self.status_label.setStyleSheet(f"color: {msg[2]};")
+                elif msg[0] == "row":
+                    self._append_row(msg[1], msg[2], msg[3])
+        except Exception:
+            pass
+
+    def _append_row(self, val, qual, ts):
+        now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        ts_str = ""
+        if ts is not None:
+            try:
+                ts_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")[:-3]
+            except Exception:
+                ts_str = str(ts)
+        row = self._row
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(now))
+        self.table.setItem(row, 1, QTableWidgetItem(str(val)))
+        qitem = QTableWidgetItem(qual)
+        if qual == "Good":
+            qitem.setForeground(QColor("#2e7d32"))
+        else:
+            qitem.setForeground(QColor("#c62828"))
+        self.table.setItem(row, 2, qitem)
+        self.table.setItem(row, 3, QTableWidgetItem(ts_str))
+        self._row += 1
+        # Cap the number of rows to avoid unbounded growth
+        if self._row > self._max_rows:
+            self.table.removeRow(0)
+            self._row -= 1
+        self.table.scrollToBottom()
+
+    def _clear(self):
+        self.table.setRowCount(0)
+        self._row = 0
+
+    def closeEvent(self, event):
+        self._timer.stop()
+        self._stop.set()
+        self._worker.join(timeout=3.0)
+        super().closeEvent(event)
+
+
 # ===================================================================
 # Preferences dialog
 # ===================================================================
@@ -1110,9 +1477,12 @@ class PreferencesDialog(QDialog):
         self.radio_info = QRadioButton("Info")
         self.radio_warning = QRadioButton("Warning")
         self.radio_error = QRadioButton("Error")
+        self.radio_verbose = QRadioButton("Verbose (incl. OPC UA request tracing)")
 
         current_level = self.prefs.get("log_level", DEFAULT_LOG_LEVEL).upper()
-        if current_level == "INFO":
+        if current_level == VERBOSE_LOG_LEVEL:
+            self.radio_verbose.setChecked(True)
+        elif current_level == "INFO":
             self.radio_info.setChecked(True)
         elif current_level == "WARNING":
             self.radio_warning.setChecked(True)
@@ -1122,6 +1492,17 @@ class PreferencesDialog(QDialog):
         log_level_layout.addWidget(self.radio_info)
         log_level_layout.addWidget(self.radio_warning)
         log_level_layout.addWidget(self.radio_error)
+        log_level_layout.addWidget(self.radio_verbose)
+
+        self.chk_verbose_asyncua = QCheckBox("Log every OPC UA request (Browse/Read/Write/Subscribe...)")
+        self.chk_verbose_asyncua.setChecked(self.prefs.get("verbose_asyncua", False))
+        verbose_hint = QLabel(
+            "asyncua logs each protocol request at INFO level, which can flood\n"
+            "the log when clients browse the address space. Enable only for debugging."
+        )
+        verbose_hint.setStyleSheet("color: gray; font-size: small;")
+        log_level_layout.addWidget(self.chk_verbose_asyncua)
+        log_level_layout.addWidget(verbose_hint)
         layout.addWidget(log_level_group)
 
         # Log File Group
@@ -1289,7 +1670,9 @@ class PreferencesDialog(QDialog):
             QMessageBox.critical(self, "Error", f"Failed to generate certificate: {e}")
 
     def get_prefs(self):
-        if self.radio_info.isChecked():
+        if self.radio_verbose.isChecked():
+            level = VERBOSE_LOG_LEVEL
+        elif self.radio_info.isChecked():
             level = "INFO"
         elif self.radio_warning.isChecked():
             level = "WARNING"
@@ -1297,6 +1680,7 @@ class PreferencesDialog(QDialog):
             level = "ERROR"
 
         log_file = self.log_file_edit.text().strip() or DEFAULT_LOG_FILE
+        verbose_asyncua = self.chk_verbose_asyncua.isChecked()
         ssl_enabled = self.chk_ssl.isChecked()
 
         # DA mode
@@ -1337,6 +1721,7 @@ class PreferencesDialog(QDialog):
         return {
             "log_level": level,
             "log_file": log_file,
+            "verbose_asyncua": verbose_asyncua,
             "ssl_enabled": ssl_enabled,
             "da_mode": da_mode,
             "poll_interval": poll_interval,
@@ -1550,25 +1935,25 @@ class MainWindow(QMainWindow):
         type_counts_after = _count_objects_by_type()
         
         if mem_before is not None and mem_after is not None:
-            self._log(f"Force GC: collected {total_collected} objects (pass1:{collected} pass2:{collected_pass2} pass3:{collected_pass3})")
-            self._log(f"  Memory: {mem_before:.1f} MB → {mem_after:.1f} MB (freed {mem_before - mem_after:.1f} MB)")
+            logger.log(VERBOSE, f"Force GC: collected {total_collected} objects (pass1:{collected} pass2:{collected_pass2} pass3:{collected_pass3})")
+            logger.log(VERBOSE, f"  Memory: {mem_before:.1f} MB → {mem_after:.1f} MB (freed {mem_before - mem_after:.1f} MB)")
             
             # Show thread status
             threads = threading.enumerate()
-            self._log(f"  Active threads: {len(threads)}")
+            logger.log(VERBOSE, f"  Active threads: {len(threads)}")
             for t in threads:
-                self._log(f"    - {t.name} (daemon={t.daemon}, alive={t.is_alive()})")
+                logger.log(VERBOSE, f"    - {t.name} (daemon={t.daemon}, alive={t.is_alive()})")
             
             # Show object count changes for key types
-            self._log(f"  Object counts (before → after [delta]):")
+            logger.log(VERBOSE, f"  Object counts (before → after [delta]):")
             for ttype in sorted(type_counts_before.keys()):
                 before = type_counts_before[ttype]
                 after = type_counts_after.get(ttype, 0)
                 delta = after - before
                 if before > 0 or after > 0:
-                    self._log(f"    {ttype}: {before} → {after} [{delta:+d}]")
+                    logger.log(VERBOSE, f"    {ttype}: {before} → {after} [{delta:+d}]")
         else:
-            self._log(f"Force GC: collected {total_collected} objects (psutil not available)")
+            logger.log(VERBOSE, f"Force GC: collected {total_collected} objects (psutil not available)")
         
         # Update memory status immediately
         self._update_memory_status()
@@ -1770,10 +2155,13 @@ class MainWindow(QMainWindow):
         self._refresh_tree()
 
     def _on_tree_double_click(self, item, column):
-        """Double-click a tag to edit it."""
-        if item.parent():
-            self.tree.setCurrentItem(item)
-            self._edit_tag()
+        """Double-click a tag to open the live DA monitor."""
+        # A tag item has two parents (folder → server); a folder has one.
+        if item.parent() and item.parent().parent():
+            srv_name = item.parent().parent().text(0)
+            tag = item.text(0)
+            dlg = DAMonitorDialog(srv_name, tag, self)
+            dlg.show()
 
     # ------------------------------------------------------------------
     # Gateway start / stop
@@ -1832,9 +2220,9 @@ class MainWindow(QMainWindow):
             collected = gc.collect()
             mem = get_memory_usage_mb()
             if mem is not None:
-                self._log(f"Gateway stopped. GC freed {collected} objects, memory: {mem:.1f} MB")
+                logger.log(VERBOSE, f"Gateway stopped. GC freed {collected} objects, memory: {mem:.1f} MB")
             else:
-                self._log(f"Gateway stopped. GC freed {collected} objects")
+                logger.log(VERBOSE, f"Gateway stopped. GC freed {collected} objects")
         
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
