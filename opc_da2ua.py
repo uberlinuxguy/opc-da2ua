@@ -160,6 +160,12 @@ def setup_logging(level=logging.INFO, log_file="gateway.log"):
 qthandler = setup_logging()
 logger = logging.getLogger("OPC_MultiServer_Gateway")
 
+# Custom log level for memory profiling / GC diagnostics. Sits between INFO
+# (20) and WARNING (30) so these messages are hidden at the default INFO
+# level and only appear when verbose logging is enabled.
+VERBOSE = 15
+logging.addLevelName(VERBOSE, "VERBOSE")
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -231,7 +237,7 @@ def apply_preferences(prefs=None):
         prefs = load_preferences()
 
     level_str = prefs.get("log_level", DEFAULT_LOG_LEVEL).upper()
-    level_map = {"INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR}
+    level_map = {"INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR, "VERBOSE": VERBOSE}
     level = level_map.get(level_str, logging.INFO)
 
     log_file = prefs.get("log_file", DEFAULT_LOG_FILE)
@@ -748,7 +754,7 @@ async def _async_gc_loop(stop_event):
     reach. Running GC from within the loop context helps release these.
     """
     interval = 30  # seconds
-    logger.info("Async GC loop started (interval=%ds)" % interval)
+    logger.log(VERBOSE, "Async GC loop started (interval=%ds)" % interval)
     prev_counts = {}  # type name -> count, for tracking growth
     loop = asyncio.get_running_loop()
     while not stop_event.is_set():
@@ -772,10 +778,10 @@ async def _async_gc_loop(stop_event):
             if mem_before is not None and mem_after is not None:
                 freed = mem_before - mem_after
                 tag = "+%.1f" % freed if freed > 0 else "%.1f" % freed
-                logger.info("Async GC: %.1f MB -> %.1f MB (%s MB), collected %d objects" % (
+                logger.log(VERBOSE, "Async GC: %.1f MB -> %.1f MB (%s MB), collected %d objects" % (
                     mem_before, mem_after, tag, total))
             else:
-                logger.info("Async GC: collected %d objects (psutil unavailable)" % total)
+                logger.log(VERBOSE, "Async GC: collected %d objects (psutil unavailable)" % total)
 
             # Track object count growth for leak diagnosis
             counts_after = await loop.run_in_executor(None, _count_objects_by_type)
@@ -787,13 +793,13 @@ async def _async_gc_loop(stop_event):
                 if delta > 10 and after > 50:  # meaningful growth
                     growing.append(f"{tname}:{delta:+d}")
             if growing:
-                logger.info("Object growth: %s" % ", ".join(sorted(growing, key=lambda x: -int(x.rsplit(':', 1)[1]))))
+                logger.log(VERBOSE, "Object growth: %s" % ", ".join(sorted(growing, key=lambda x: -int(x.rsplit(':', 1)[1]))))
             prev_counts = counts_after
         except asyncio.CancelledError:
-            logger.info("Async GC loop cancelled")
+            logger.log(VERBOSE, "Async GC loop cancelled")
             raise
         except Exception as e:
-            logger.info(f"Async GC error: {e}")
+            logger.log(VERBOSE, f"Async GC error: {e}")
 
 
 def _interruptible_sleep(duration, stop_event=None):
@@ -825,7 +831,7 @@ def log_memory_usage(logger, tag=""):
     mem_mb = get_memory_usage_mb()
     if mem_mb is not None:
         tag_str = f" [{tag}]" if tag else ""
-        logger.info(f"Memory usage{tag_str}: {mem_mb:.1f} MB")
+        logger.log(VERBOSE, f"Memory usage{tag_str}: {mem_mb:.1f} MB")
 
 
 def _count_objects_by_type():
@@ -1052,7 +1058,7 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
             if mem_before is not None and mem_after is not None:
                 freed = mem_before - mem_after
                 if freed > 0.5:  # only log if meaningful amount freed
-                    logger.info(f"[{server_name}] GC: {mem_before:.1f} MB → {mem_after:.1f} MB (freed {freed:.1f} MB)")
+                    logger.log(VERBOSE, f"[{server_name}] GC: {mem_before:.1f} MB → {mem_after:.1f} MB (freed {freed:.1f} MB)")
             last_gc_time = now
 
         # Check if it's time for periodic reinitialization
@@ -1929,25 +1935,25 @@ class MainWindow(QMainWindow):
         type_counts_after = _count_objects_by_type()
         
         if mem_before is not None and mem_after is not None:
-            self._log(f"Force GC: collected {total_collected} objects (pass1:{collected} pass2:{collected_pass2} pass3:{collected_pass3})")
-            self._log(f"  Memory: {mem_before:.1f} MB → {mem_after:.1f} MB (freed {mem_before - mem_after:.1f} MB)")
+            logger.log(VERBOSE, f"Force GC: collected {total_collected} objects (pass1:{collected} pass2:{collected_pass2} pass3:{collected_pass3})")
+            logger.log(VERBOSE, f"  Memory: {mem_before:.1f} MB → {mem_after:.1f} MB (freed {mem_before - mem_after:.1f} MB)")
             
             # Show thread status
             threads = threading.enumerate()
-            self._log(f"  Active threads: {len(threads)}")
+            logger.log(VERBOSE, f"  Active threads: {len(threads)}")
             for t in threads:
-                self._log(f"    - {t.name} (daemon={t.daemon}, alive={t.is_alive()})")
+                logger.log(VERBOSE, f"    - {t.name} (daemon={t.daemon}, alive={t.is_alive()})")
             
             # Show object count changes for key types
-            self._log(f"  Object counts (before → after [delta]):")
+            logger.log(VERBOSE, f"  Object counts (before → after [delta]):")
             for ttype in sorted(type_counts_before.keys()):
                 before = type_counts_before[ttype]
                 after = type_counts_after.get(ttype, 0)
                 delta = after - before
                 if before > 0 or after > 0:
-                    self._log(f"    {ttype}: {before} → {after} [{delta:+d}]")
+                    logger.log(VERBOSE, f"    {ttype}: {before} → {after} [{delta:+d}]")
         else:
-            self._log(f"Force GC: collected {total_collected} objects (psutil not available)")
+            logger.log(VERBOSE, f"Force GC: collected {total_collected} objects (psutil not available)")
         
         # Update memory status immediately
         self._update_memory_status()
@@ -2214,9 +2220,9 @@ class MainWindow(QMainWindow):
             collected = gc.collect()
             mem = get_memory_usage_mb()
             if mem is not None:
-                self._log(f"Gateway stopped. GC freed {collected} objects, memory: {mem:.1f} MB")
+                logger.log(VERBOSE, f"Gateway stopped. GC freed {collected} objects, memory: {mem:.1f} MB")
             else:
-                self._log(f"Gateway stopped. GC freed {collected} objects")
+                logger.log(VERBOSE, f"Gateway stopped. GC freed {collected} objects")
         
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
