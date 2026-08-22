@@ -534,6 +534,7 @@ async def _da_write_ua_batch_direct_impl(ua_server, write_list):
     WriteParameters, and ServerItemCallback objects per tag per cycle.
     """
     aspace = ua_server.iserver.aspace
+    count = 0
     for node, val in write_list:
         nid = node.nodeid
         # Record the write BEFORE writing so the UA write monitor doesn't
@@ -553,12 +554,19 @@ async def _da_write_ua_batch_direct_impl(ua_server, write_list):
                     vtype = ua.Variant(val).VariantType
                 _node_variant_types[nid] = vtype
             dv = ua.DataValue(ua.Variant(val, vtype))
-            await aspace.write_attribute_value(nid, ua.AttributeIds.Value, dv)
-            if not hasattr(_da_write_ua_batch_direct_impl, '_logged_first'):
-                _da_write_ua_batch_direct_impl._logged_first = True
-                logger.info(f"First UA write OK: {nid} = {val} (vtype={vtype})")
+            status = await aspace.write_attribute_value(nid, ua.AttributeIds.Value, dv)
+            if not status.is_good():
+                logger.warning(f"UA write rejected for {nid}: {status}")
         except Exception as e:
             logger.warning(f"Direct batch write error for {nid}: {e}")
+        # Yield to the event loop periodically. A 5,889-tag batch otherwise
+        # runs as one long uninterrupted chunk (the datachange callbacks
+        # mostly complete without suspending), starving the loop so UA
+        # clients can't get Browse/Read/Publish serviced and their sessions
+        # time out. Yielding every 250 writes keeps the loop responsive.
+        count += 1
+        if count % 250 == 0:
+            await asyncio.sleep(0)
 
 
 def _da_write_ua_batch(write_list):
@@ -606,7 +614,11 @@ async def _ua_write_monitor(ua_server, ua_vars, handler, stop_event, client_coun
         if has_clients:
             await asyncio.sleep(poll_interval)
             try:
-                for nodeid, node in node_list:
+                for i, (nodeid, node) in enumerate(node_list):
+                    # Yield periodically so the loop stays responsive to
+                    # client requests while scanning thousands of nodes.
+                    if i % 500 == 0:
+                        await asyncio.sleep(0)
                     # Read directly from address space – no session stack
                     try:
                         ua_node = aspace.get(nodeid)
@@ -738,6 +750,7 @@ async def _async_gc_loop(stop_event):
     interval = 30  # seconds
     logger.info("Async GC loop started (interval=%ds)" % interval)
     prev_counts = {}  # type name -> count, for tracking growth
+    loop = asyncio.get_running_loop()
     while not stop_event.is_set():
         await asyncio.sleep(interval)
         try:
@@ -746,12 +759,14 @@ async def _async_gc_loop(stop_event):
             if ua_server_global is not None:
                 await _reap_idle_sessions(ua_server_global)
             mem_before = get_memory_usage_mb()
-            # Count objects before GC to track what's accumulating
-            counts_before = _count_objects_by_type()
-            # Run 3 GC passes to break reference cycles
-            n1 = gc.collect()
-            n2 = gc.collect()
-            n3 = gc.collect()
+            # Run the blocking GC work in a thread-pool executor. gc.collect()
+            # and the object census are synchronous and can take well over a
+            # second with 100k+ live objects; running them on the event loop
+            # thread stalls it and causes UA client sessions to time out.
+            counts_before = await loop.run_in_executor(None, _count_objects_by_type)
+            n1 = await loop.run_in_executor(None, gc.collect)
+            n2 = await loop.run_in_executor(None, gc.collect)
+            n3 = await loop.run_in_executor(None, gc.collect)
             total = n1 + n2 + n3
             mem_after = get_memory_usage_mb()
             if mem_before is not None and mem_after is not None:
@@ -763,7 +778,7 @@ async def _async_gc_loop(stop_event):
                 logger.info("Async GC: collected %d objects (psutil unavailable)" % total)
 
             # Track object count growth for leak diagnosis
-            counts_after = _count_objects_by_type()
+            counts_after = await loop.run_in_executor(None, _count_objects_by_type)
             growing = []
             for tname in counts_after:
                 before = prev_counts.get(tname, 0)
@@ -1106,10 +1121,8 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                 # update= sets the group's update rate (ms) when the group is
                 # first created; it is ignored on subsequent reads.
                 write_batch = []
-                read_count = 0
                 try:
                     for tname, val, qual, ts in da_client.read(tags, group=f"{server_name}_sub", update=int(poll_interval * 1000)):
-                        read_count += 1
                         if qual == "Good":
                             node = ua_variables.get(tname)
                             if node is not None:
@@ -1122,17 +1135,14 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                 except Exception as e:
                     raise
 
-                # Diagnostic: log the first few reads to see what's coming back
-                if read_count > 0 and not hasattr(_opc_da_worker_loop, f'_sub_logged_{server_name}'):
-                    setattr(_opc_da_worker_loop, f'_sub_logged_{server_name}', True)
-                    logger.info(f"[{server_name}] subscription read returned {read_count} item(s), {len(write_batch)} Good → writing")
-
-                # Submit all writes as a single batch (direct address space write)
+                # Submit all writes as a single batch (direct address space write).
+                # Pass a COPY of the list: the coroutine iterates it on the
+                # event-loop thread, so clearing write_batch here would race
+                # with the iteration and silently drop most of the tags.
                 if write_batch and async_loop:
-                    future = _da_write_ua_batch_direct(write_batch)
-                    write_batch.clear()
+                    future = _da_write_ua_batch_direct(list(write_batch))
                     try:
-                        future.result(timeout=2.0)
+                        future.result(timeout=5.0)
                     except Exception as e:
                         logger.warning(f"[{server_name}] batch write error: {e}")
                     finally:
@@ -1149,12 +1159,13 @@ def _opc_da_worker_loop(server_name, tags, ua_variables, ua_status_node, server_
                             write_batch.append((node, val))
                         del tname, val, qual, ts
 
-                    # Submit batch (direct address space write)
+                    # Submit batch (direct address space write). Pass a COPY:
+                    # the coroutine iterates it on the event-loop thread, so
+                    # mutating write_batch here would race with the iteration.
                     if write_batch and async_loop:
-                        future = _da_write_ua_batch_direct(write_batch)
-                        write_batch.clear()
+                        future = _da_write_ua_batch_direct(list(write_batch))
                         try:
-                            future.result(timeout=2.0)
+                            future.result(timeout=5.0)
                         except Exception as e:
                             logger.warning(f"[{server_name}] batch write error: {e}")
                         finally:
